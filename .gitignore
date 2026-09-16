@@ -6,3 +6,10 @@ build/
 .venv/
 .eggs/
 batch_apply*.py
+.env
+.env.*
+!.env.example
+.secrets/
+state.json
+session.json
+.DS_Store

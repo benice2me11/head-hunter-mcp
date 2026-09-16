@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import logging
-import sys
 
 
 def main() -> None:
@@ -9,9 +8,7 @@ def main() -> None:
     parser.add_argument("--login", action="store_true", help="Launch browser for authentication")
     parser.add_argument("--no-headless", action="store_true", help="Run browser with visible window")
     parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    parser.add_argument("--transport", default="stdio", choices=["stdio", "streamable-http"])
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--transport", default="stdio", choices=["stdio"])
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(name)s: %(message)s")
@@ -28,7 +25,4 @@ def main() -> None:
     from hh_mcp_server.server import create_mcp_server
     mcp = create_mcp_server()
 
-    if args.transport == "streamable-http":
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
-    else:
-        mcp.run(transport="stdio")
+    mcp.run(transport="stdio", show_banner=False)

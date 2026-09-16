@@ -15,20 +15,29 @@ async def get_my_resumes(page: Page) -> list[dict]:
 
     cards = await page.query_selector_all(S.RESUME_CARD)
     resumes = []
+    seen = set()
 
     for card in cards:
         title_el = await card.query_selector(S.RESUME_TITLE_LINK)
         if not title_el:
             continue
 
-        title = (await title_el.inner_text()).strip()
         href = await title_el.get_attribute("href") or ""
         resume_id = extract_resume_id(href)
+        if not resume_id or resume_id in seen:
+            continue
+        # The current profile page wraps the title, salary and schedule in one
+        # link; use the observed title element and retain the legacy fallback.
+        heading = await card.query_selector(S.RESUME_TITLE) or title_el
+        title = (await heading.inner_text()).strip()
+        if not title:
+            continue
+        seen.add(resume_id)
 
         resumes.append({
             "id": resume_id,
             "title": title,
-            "url": f"{BASE_URL}/resume/{resume_id}" if resume_id else href,
+            "url": f"{BASE_URL}/resume/{resume_id}",
         })
 
     return resumes

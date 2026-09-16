@@ -36,6 +36,7 @@ QUESTION_INPUT = "input, textarea, select"
 # === Resume ===
 RESUME_CARD = "[data-qa='resume']"
 RESUME_TITLE_LINK = "[data-qa^='resume-card-link'], [data-qa='resume-title-link']"
+RESUME_TITLE = "[data-qa='resume-title']"
 
 # === Responses/Negotiations ===
 RESPONSE_ITEM = "[data-qa='negotiations-item']"

@@ -1,0 +1,10 @@
+Date: 2026-09-16
+Command: .venv/bin/python -m unittest discover -s tests -q
+Environment: Python 3.12.14, macOS arm64, Playwright 1.63.0
+Tests: 24
+Elapsed seconds: 16.760
+Result: OK
+
+Browser tests used synthetic HH pages with intercepted requests.
+No live account access or job application was performed.
+The MCP confirmation rejection is an expected negative test.

@@ -1,205 +1,144 @@
-import logging
-
-from playwright.async_api import Page
-
+"""UI application submission with payload validation and positive result checks."""
+import asyncio
+from playwright.async_api import Page, TimeoutError as BrowserTimeout
 from hh_mcp_server.constants import BASE_URL
 from hh_mcp_server.scraping import selectors as S
-from hh_mcp_server.scraping.extractor import navigate_and_wait
-from hh_mcp_server.exceptions import ApplyError
-
-logger = logging.getLogger(__name__)
+from hh_mcp_server.submission_guard import SubmissionGuard
 
 
-async def detect_questions(page: Page) -> list[dict]:
-    """Detect employer questions in the apply form.
-
-    Works for both popup and full-page response forms.
-    Questions are textareas with name='task_*_text'.
-    """
-    questions = []
-
-    result = await page.evaluate("""() => {
-        const textareas = document.querySelectorAll('textarea[name^="task_"]');
-        const out = [];
-        for (const ta of textareas) {
-            const name = ta.getAttribute('name') || '';
-            // Walk up to find the question container and extract label
-            let el = ta;
-            let labelText = '';
-            for (let i = 0; i < 8 && el.parentElement; i++) {
-                el = el.parentElement;
-                // Look for text nodes that are the question label
-                const children = el.children;
-                for (const child of children) {
-                    // Skip the textarea wrapper itself
-                    if (child.querySelector('textarea')) continue;
-                    const t = child.textContent.trim();
-                    if (t && t.length > 3 && t.length < 500
-                        && !t.includes('Писать тут')
-                        && !t.includes('0/')
-                        && t !== 'Ответьте на вопросы') {
-                        labelText = t;
-                        break;
-                    }
-                }
-                if (labelText) break;
-            }
-            out.push({name: name, label: labelText});
-        }
-        return out;
-    }""")
-
-    for item in result:
-        questions.append({
-            "label": item["label"],
-            "type": "textarea",
-            "name": item["name"],
-        })
-
-    return questions
+async def visible(page, selectors):
+    for selector in selectors:
+        for candidate in await page.locator(selector).all():
+            if await candidate.is_visible():
+                return candidate
+    return None
 
 
-async def fill_questions(page: Page, questions: list[dict], answers: dict[str, str]) -> None:
-    """Fill in question answers by matching label text or name to textarea."""
-    for q in questions:
-        label = q["label"]
-        name = q["name"]
-        # Try matching by label first, then by name
-        answer = answers.get(label) or answers.get(name)
-        if not answer:
-            # Try fuzzy match - strip whitespace and compare
-            for key, val in answers.items():
-                if key.strip() == label.strip():
-                    answer = val
-                    break
-        if not answer:
-            logger.warning("No answer found for question: %s (name=%s)", label, name)
+async def select_resume(page, resume_id, resume_title):
+    for selector in ['select[name="resume_hash"]', 'select[name="resume_id"]', S.RESUME_SELECT]:
+        control = await visible(page, [selector])
+        if control is None:
             continue
+        if await control.evaluate('(e) => e.tagName') == 'SELECT':
+            if await control.locator(f'option[value="{resume_id}"]').count() == 1:
+                await control.select_option(resume_id)
+                return await control.input_value() == resume_id
+        else:
+            await control.click()
+            option = page.get_by_role('option', name=resume_title, exact=True)
+            if await option.count() == 1:
+                await option.click()
+                return True  # Exact resume ID is also enforced on the outgoing request.
+    radio = page.locator(f'input[type="radio"][value="{resume_id}"]')
+    if await radio.count() == 1:
+        await radio.check()
+        return await radio.is_checked()
+    current = page.locator('input[name="resume_hash"], input[name="resume_id"], input[name="resumeId"]')
+    values = [await item.input_value() for item in await current.all()]
+    return bool(values) and all(value == resume_id for value in values)
 
-        textarea = await page.query_selector(f'textarea[name="{name}"]')
-        if textarea:
-            await textarea.fill(answer)
-            logger.info("Filled question '%s' with answer", label[:50])
+
+async def questions_and_fill(page, approved_answers):
+    questions = []
+    controls = await page.locator('textarea[name^="task_"], input[name^="task_"], select[name^="task_"]').all()
+    for control in controls:
+        name = await control.get_attribute('name')
+        tag = await control.evaluate('(e) => e.tagName.toLowerCase()')
+        kind = await control.get_attribute('type') or tag
+        label = await control.evaluate("(e) => e.labels?.[0]?.innerText || e.closest('[data-qa=task-body]')?.innerText || e.getAttribute('aria-label') || e.name")
+        questions.append({'name': name, 'label': label[:1000], 'type': kind})
+        if name not in approved_answers or tag != 'textarea':
+            continue
+        await control.fill(approved_answers[name])
+        if await control.input_value() != approved_answers[name]:
+            raise ValueError('Approved questionnaire answer could not be verified.')
+    incomplete = any(q['name'] not in approved_answers or q['type'] != 'textarea' for q in questions)
+    extra = set(approved_answers) - {q['name'] for q in questions}
+    return questions, incomplete or bool(extra)
 
 
-async def dismiss_cookie_banner(page: Page) -> None:
-    """Dismiss cookie consent banner if present."""
+async def fill_letter(page, letter):
+    field = await visible(page, [S.COVER_LETTER_INPUT, 'textarea[name="letter"]', 'textarea[name="cover_letter"]'])
+    if field is None:
+        toggle = await visible(page, [S.COVER_LETTER_TOGGLE])
+        if toggle:
+            await toggle.click()
+            field = await visible(page, [S.COVER_LETTER_INPUT, 'textarea[name="letter"]', 'textarea[name="cover_letter"]'])
+    if field is None:
+        return letter == ''  # A nonempty approved letter must never be dropped.
+    await field.fill(letter)
+    return await field.input_value() == letter
+
+
+async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
+    guard = SubmissionGuard(content, on_dispatch)
+    context = page.context
+    await context.route('**/*', guard.handle)
+    page.on('response', guard.observe_response)
+    url = f"{BASE_URL}/vacancy/{content['vacancy_id']}"
     try:
-        btn = await page.query_selector("[data-qa='cookies-policy-informer-accept']")
-        if btn:
-            await btn.click()
-            await page.wait_for_timeout(500)
-    except Exception:
-        pass
-
-
-async def _fill_cover_letter(page: Page, cover_letter: str) -> None:
-    """Fill cover letter on the page (works for both popup and full-page forms)."""
-    toggle = await page.query_selector(S.COVER_LETTER_TOGGLE)
-    if toggle:
-        await toggle.click()
-        await page.wait_for_timeout(1000)
-
-    letter_input = await page.query_selector(S.COVER_LETTER_INPUT)
-    if letter_input:
-        await letter_input.fill(cover_letter)
-        logger.info("Cover letter filled")
-    else:
-        logger.warning("Cover letter input not found")
-
-
-async def apply_to_vacancy(
-    page: Page,
-    vacancy_id: str,
-    resume_id: str | None = None,
-    cover_letter: str | None = None,
-    question_answers: dict[str, str] | None = None,
-) -> dict:
-    url = f"{BASE_URL}/vacancy/{vacancy_id}"
-    await navigate_and_wait(page, url)
-
-    await dismiss_cookie_banner(page)
-
-    # Check if already applied
-    already = await page.query_selector(S.ALREADY_APPLIED)
-    if already:
-        return {"status": "already_applied", "message": "You have already applied to this vacancy."}
-
-    # Click apply button
-    apply_btn = await page.query_selector(S.APPLY_BUTTON)
-    if not apply_btn:
-        return {"status": "error", "message": "Apply button not found. Vacancy may be closed."}
-
-    await apply_btn.click()
-    await page.wait_for_timeout(2000)
-
-    # Handle relocation warning popup if it appears
-    relocation_confirm = await page.query_selector("[data-qa='relocation-warning-confirm']")
-    if relocation_confirm:
-        await relocation_confirm.click()
-        await page.wait_for_timeout(2000)
-
-    # Check if redirected to full-page response form
-    is_response_page = "vacancy_response" in page.url
-
-    # Check if a popup form appeared
-    form = await page.query_selector(S.APPLY_FORM)
-
-    if not form and not is_response_page:
-        # Maybe it applied directly (one-click apply)
-        if "negotiations" in page.url:
-            return {"status": "success", "message": "Applied successfully (direct apply)."}
-
-        # Re-check if already applied (button click may have triggered a quick-apply)
-        already_after_click = await page.query_selector(S.ALREADY_APPLIED)
-        if already_after_click:
-            return {"status": "already_applied", "message": "You have already applied to this vacancy."}
-
-        return {"status": "error", "message": "Apply form did not appear."}
-
-    # Detect questions
-    questions = await detect_questions(page)
-    if questions and not question_answers:
-        return {
-            "status": "questions_required",
-            "message": "This vacancy has questions that need to be answered. Call again with question_answers.",
-            "questions": questions,
-        }
-
-    # Fill questions if provided
-    if question_answers and questions:
-        await fill_questions(page, questions, question_answers)
-
-    # Fill cover letter
-    if cover_letter:
-        await _fill_cover_letter(page, cover_letter)
-
-    # Submit
-    submit_btn = await page.query_selector(S.SUBMIT_BUTTON)
-    if not submit_btn:
-        return {"status": "error", "message": "Submit button not found."}
-
-    await submit_btn.click()
-    await page.wait_for_timeout(3000)
-
-    # Check if still on response page (submit failed due to validation)
-    if "vacancy_response" in page.url:
-        # Check for validation errors
-        error_text = await page.evaluate("""() => {
-            const el = document.querySelector('[data-qa="vacancy-response-popup-error"]');
-            if (el) return el.textContent.trim();
-            // Check if questions are still shown (not answered)
-            const q = document.querySelector('textarea[name^="task_"]');
-            if (q) return 'Required questions were not answered.';
-            return '';
-        }""")
-        if error_text:
-            return {"status": "error", "message": error_text}
-
-    # Check for error in popup form
-    error_el = await page.query_selector("[data-qa='vacancy-response-popup-error']")
-    if error_el:
-        error_text = await error_el.inner_text()
-        return {"status": "error", "message": error_text.strip()}
-
-    return {"status": "success", "message": f"Applied to vacancy {vacancy_id} successfully."}
+        await page.goto(url, wait_until='domcontentloaded')
+        if await page.locator(S.ALREADY_APPLIED).count():
+            return {'status': 'already_applied', 'url': url}
+        if await page.locator(S.DETAIL_TITLE).count() != 1:
+            return {'status': 'blocked', 'reason': 'Vacancy is unavailable or page structure changed.'}
+        if (await page.locator(S.DETAIL_TITLE).inner_text()).strip() != content['vacancy_title']:
+            return {'status': 'blocked', 'reason': 'Vacancy title changed since review; prepare a new draft.'}
+        employer = page.locator(S.DETAIL_EMPLOYER)
+        if await employer.count() != 1 or (await employer.inner_text()).strip() != content['employer']:
+            return {'status': 'blocked', 'reason': 'Employer changed or could not be verified; prepare a new draft.'}
+        cookie = await visible(page, ['[data-qa="cookies-policy-informer-accept"]'])
+        if cookie:
+            await cookie.click()
+        button = await visible(page, [S.APPLY_BUTTON])
+        if button is None:
+            return {'status': 'blocked', 'reason': 'Application control not found.'}
+        # Read-only network phase: a one-click application POST is blocked here.
+        await button.click()
+        try:
+            await page.wait_for_selector(S.SUBMIT_BUTTON, timeout=5000)
+        except BrowserTimeout:
+            return {'status': 'blocked', 'reason': guard.error or 'No verifiable application form. Manual review required.'}
+        if guard.error:
+            return {'status': 'blocked', 'reason': guard.error}
+        if await visible(page, ['[data-qa="relocation-warning-confirm"]']):
+            return {'status': 'blocked', 'reason': 'Relocation warning requires separate user review.'}
+        questions, incomplete = await questions_and_fill(page, content.get('question_answers') or {})
+        if incomplete:
+            return {'status': 'questions_required', 'questions': questions,
+                    'reason': 'Review the questions and prepare a new draft with approved answers.'}
+        if not await select_resume(page, content['resume_id'], content['resume_title']):
+            return {'status': 'blocked', 'reason': 'The approved resume could not be selected and verified.'}
+        if not await fill_letter(page, content['cover_letter']):
+            return {'status': 'blocked', 'reason': 'The approved cover letter could not be filled and verified.'}
+        submit = await visible(page, [S.SUBMIT_BUTTON])
+        if submit is None or not await submit.is_enabled():
+            return {'status': 'blocked', 'reason': 'Submission is unavailable or the form is incomplete.'}
+        guard.commit = True
+        await submit.click()
+        for _ in range(50):
+            if guard.error or guard.response_status is not None:
+                break
+            await asyncio.sleep(0.1)
+        if not guard.dispatched:
+            return {'status': 'blocked', 'reason': guard.error or 'No approved application request was sent.'}
+        if guard.response_status is None or not 200 <= guard.response_status < 300:
+            return {'status': 'unverified', 'reason': 'Request was dispatched but success is unverified. Check history before any retry.'}
+        # A successful HTTP response alone is insufficient: reload the vacancy.
+        await page.goto(url, wait_until='domcontentloaded')
+        try:
+            await page.wait_for_selector(S.ALREADY_APPLIED, timeout=8000)
+        except BrowserTimeout:
+            return {'status': 'unverified', 'reason': 'HH has not visibly confirmed the application. Check history; do not retry automatically.'}
+        return {'status': 'success', 'url': url, 'verified_by': 'exact outgoing payload and application marker after reload'}
+    except Exception as error:
+        return {'status': 'unverified' if guard.dispatched else 'blocked',
+                'reason': 'Application interrupted; check history before retrying.' if guard.dispatched else 'Form interaction failed; no approved request was dispatched.',
+                'error_type': type(error).__name__}
+    finally:
+        page.remove_listener('response', guard.observe_response)
+        # Stop delayed page scripts before removing the request guard. If closing
+        # fails (including cancellation), retain the guard for this context.
+        await page.close()
+        if page.is_closed():
+            await context.unroute('**/*', guard.handle)

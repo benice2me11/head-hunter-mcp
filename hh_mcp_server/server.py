@@ -1,9 +1,11 @@
 import logging
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware
 
 from hh_mcp_server.constants import TOOL_TIMEOUT_SECONDS
 from hh_mcp_server.drivers.browser import close_browser
@@ -16,16 +18,28 @@ from hh_mcp_server.tools.responses import register_response_tools
 logger = logging.getLogger(__name__)
 
 
+class SingleBrowserOperation(Middleware):
+    def __init__(self):
+        self.lock = asyncio.Lock()
+
+    async def on_call_tool(self, context, call_next):
+        async with self.lock:
+            return await call_next(context)
+
+
 @asynccontextmanager
 async def server_lifespan(app: FastMCP) -> AsyncIterator[dict[str, Any]]:
     logger.info("HH MCP Server starting...")
-    yield {}
-    logger.info("HH MCP Server shutting down...")
-    await close_browser()
+    try:
+        yield {}
+    finally:
+        logger.info("HH MCP Server shutting down...")
+        await close_browser()
 
 
 def create_mcp_server() -> FastMCP:
     mcp = FastMCP("hh_scraper", lifespan=server_lifespan)
+    mcp.add_middleware(SingleBrowserOperation())
 
     register_vacancy_tools(mcp)
     register_apply_tools(mcp)

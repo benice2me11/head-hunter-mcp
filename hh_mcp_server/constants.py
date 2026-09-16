@@ -1,9 +1,16 @@
 from pathlib import Path
+import os
+
+from dotenv import load_dotenv
+
+if os.environ.get("HH_ENV_FILE"):
+    load_dotenv(os.environ["HH_ENV_FILE"], override=False)
 
 TOOL_TIMEOUT_SECONDS: float = 90.0
 BASE_URL = "https://hh.ru"
-PROFILE_DIR = Path.home() / ".hh-mcp" / "profile"
-STATE_FILE = PROFILE_DIR / "state.json"
+STATE_FILE = Path(os.environ.get("HH_STATE_FILE", str(Path.home() / ".hh-mcp" / "profile" / "state.json"))).expanduser().resolve()
+PROFILE_DIR = STATE_FILE.parent
+DRAFT_DIR = PROFILE_DIR / "drafts"
 
 AREA_CODES = {
     "москва": "1",
