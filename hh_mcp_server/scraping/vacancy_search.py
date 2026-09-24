@@ -60,6 +60,10 @@ async def parse_vacancy_cards(page: Page) -> list[dict]:
         vacancy_id = extract_vacancy_id(href)
 
         salary_el = await card.query_selector(S.VACANCY_SALARY)
+        if not salary_el:
+            # Current HH SERP renders compensation without data-qa, as a span
+            # containing numeric and currency <data> elements.
+            salary_el = await card.query_selector("span:has(> data[value])")
         salary = (await salary_el.inner_text()).strip() if salary_el else None
 
         employer_el = await card.query_selector(S.VACANCY_EMPLOYER)
@@ -109,6 +113,8 @@ async def search_vacancies(
 
         if total_found is None:
             total_found = await extract_text(page, S.SEARCH_RESULT_COUNT)
+            if total_found is None:
+                total_found = await extract_text(page, "[data-qa='vacancies-search-header']")
 
         vacancies = await parse_vacancy_cards(page)
         if not vacancies:
@@ -158,6 +164,8 @@ async def get_recommended_vacancies(
 
         if total_found is None:
             total_found = await extract_text(page, S.SEARCH_RESULT_COUNT)
+            if total_found is None:
+                total_found = await extract_text(page, "[data-qa='vacancies-search-header']")
 
         vacancies = await parse_vacancy_cards(page)
         if not vacancies:
