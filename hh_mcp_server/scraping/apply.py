@@ -4,6 +4,8 @@ from playwright.async_api import Page, TimeoutError as BrowserTimeout
 from hh_mcp_server.constants import BASE_URL
 from hh_mcp_server.scraping import selectors as S
 from hh_mcp_server.submission_guard import SubmissionGuard
+from hh_mcp_server.scraping.vacancy_detail import extract_vacancy_page
+from hh_mcp_server.snapshots import normalized_label, normalized_text, vacancy_snapshot
 
 
 async def visible(page, selectors):
@@ -35,7 +37,14 @@ async def select_resume(page, resume_id, resume_title):
         return await radio.is_checked()
     current = page.locator('input[name="resume_hash"], input[name="resume_id"], input[name="resumeId"]')
     values = [await item.input_value() for item in await current.all()]
-    return bool(values) and all(value == resume_id for value in values)
+    if values:
+        return all(value == resume_id for value in values)
+    # The current HH dialog keeps the selected ID in React state. Accept only
+    # one visible exact title; SubmissionGuard still checks the outgoing ID.
+    titles = [item for item in await page.locator(S.SELECTED_RESUME_TITLE).all()
+              if await item.is_visible()]
+    return (len(titles) == 1
+            and normalized_text(await titles[0].inner_text()) == normalized_text(resume_title))
 
 
 async def questions_and_fill(page, approved_answers):
@@ -58,12 +67,17 @@ async def questions_and_fill(page, approved_answers):
 
 
 async def fill_letter(page, letter):
-    field = await visible(page, [S.COVER_LETTER_INPUT, 'textarea[name="letter"]', 'textarea[name="cover_letter"]'])
+    selectors = [S.COVER_LETTER_INPUT, 'textarea[name="letter"]', 'textarea[name="cover_letter"]']
+    field = await visible(page, selectors)
     if field is None:
         toggle = await visible(page, [S.COVER_LETTER_TOGGLE])
         if toggle:
             await toggle.click()
-            field = await visible(page, [S.COVER_LETTER_INPUT, 'textarea[name="letter"]', 'textarea[name="cover_letter"]'])
+            try:
+                await page.wait_for_selector(', '.join(selectors), state='visible', timeout=5000)
+            except BrowserTimeout:
+                return False
+            field = await visible(page, selectors)
     if field is None:
         return letter == ''  # A nonempty approved letter must never be dropped.
     await field.fill(letter)
@@ -82,11 +96,15 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             return {'status': 'already_applied', 'url': url}
         if await page.locator(S.DETAIL_TITLE).count() != 1:
             return {'status': 'blocked', 'reason': 'Vacancy is unavailable or page structure changed.'}
-        if (await page.locator(S.DETAIL_TITLE).inner_text()).strip() != content['vacancy_title']:
+        if normalized_label(await page.locator(S.DETAIL_TITLE).inner_text()) != normalized_label(content['vacancy_title']):
             return {'status': 'blocked', 'reason': 'Vacancy title changed since review; prepare a new draft.'}
         employer = page.locator(S.DETAIL_EMPLOYER)
-        if await employer.count() != 1 or (await employer.inner_text()).strip() != content['employer']:
+        if await employer.count() != 1 or normalized_label(await employer.inner_text()) != normalized_label(content['employer']):
             return {'status': 'blocked', 'reason': 'Employer changed or could not be verified; prepare a new draft.'}
+        if 'vacancy_snapshot' in content:
+            current = vacancy_snapshot(await extract_vacancy_page(page, content['vacancy_id']))
+            if current != content['vacancy_snapshot']:
+                return {'status': 'blocked', 'reason': 'Vacancy terms materially changed; prepare and approve a new draft.'}
         cookie = await visible(page, ['[data-qa="cookies-policy-informer-accept"]'])
         if cookie:
             await cookie.click()
@@ -101,6 +119,10 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             return {'status': 'blocked', 'reason': guard.error or 'No verifiable application form. Manual review required.'}
         if guard.error:
             return {'status': 'blocked', 'reason': guard.error}
+        warning = await visible(page, [S.RESUME_VISIBILITY_WARNING])
+        if warning:
+            return {'status': 'blocked', 'reason': 'HH requires a resume visibility change; obtain separate privacy approval.',
+                    'blocker': 'resume_visibility_review_required', 'details': await warning.inner_text()}
         if await visible(page, ['[data-qa="relocation-warning-confirm"]']):
             return {'status': 'blocked', 'reason': 'Relocation warning requires separate user review.'}
         questions, incomplete = await questions_and_fill(page, content.get('question_answers') or {})
@@ -114,6 +136,10 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
         submit = await visible(page, [S.SUBMIT_BUTTON])
         if submit is None or not await submit.is_enabled():
             return {'status': 'blocked', 'reason': 'Submission is unavailable or the form is incomplete.'}
+        if 'vacancy_snapshot' in content:
+            current = vacancy_snapshot(await extract_vacancy_page(page, content['vacancy_id']))
+            if current != content['vacancy_snapshot']:
+                return {'status': 'blocked', 'reason': 'Vacancy terms changed while filling the form; review a new draft.'}
         guard.commit = True
         await submit.click()
         for _ in range(50):

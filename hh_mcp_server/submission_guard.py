@@ -39,6 +39,11 @@ def parse_fields(body: bytes, content_type: str) -> dict[str, str]:
 
 
 def matches_application(fields: dict[str, str], expected: dict) -> bool:
+    def same_text(actual: str | None, approved: str) -> bool:
+        # Browser form serialization converts textarea LF to CRLF. Preserve
+        # every other character, including leading/trailing spaces and lines.
+        return actual is not None and actual.replace('\r\n', '\n') == approved.replace('\r\n', '\n')
+
     def one_of(names: tuple[str, ...], value: str) -> bool:
         found = [fields[name] for name in names if name in fields]
         return bool(found) and all(item == value for item in found)
@@ -47,10 +52,10 @@ def matches_application(fields: dict[str, str], expected: dict) -> bool:
     if not one_of(("resume_hash", "resume_id", "resumeId", "resumeHash"), expected["resume_id"]):
         return False
     letters = [fields[name] for name in ("letter", "cover_letter", "coverLetter") if name in fields]
-    if (letters and any(value != expected["cover_letter"] for value in letters)) or (not letters and expected["cover_letter"]):
+    if (letters and any(not same_text(value, expected["cover_letter"]) for value in letters)) or (not letters and expected["cover_letter"]):
         return False
     answers = expected.get("question_answers") or {}
-    if any(fields.get(name) != value for name, value in answers.items()):
+    if any(not same_text(fields.get(name), value) for name, value in answers.items()):
         return False
     # Unknown questionnaire answers must never be submitted automatically.
     if any(name.startswith("task_") and name not in answers for name in fields):

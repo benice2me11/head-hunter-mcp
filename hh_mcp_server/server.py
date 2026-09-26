@@ -12,6 +12,7 @@ from hh_mcp_server.drivers.browser import close_browser
 from hh_mcp_server.tools.vacancy import register_vacancy_tools
 from hh_mcp_server.tools.apply import register_apply_tools
 from hh_mcp_server.tools.resume import register_resume_tools
+from hh_mcp_server.tools.resume_update import register_resume_update_tools
 from hh_mcp_server.tools.employer import register_employer_tools
 from hh_mcp_server.tools.responses import register_response_tools
 
@@ -44,6 +45,7 @@ def create_mcp_server() -> FastMCP:
     register_vacancy_tools(mcp)
     register_apply_tools(mcp)
     register_resume_tools(mcp)
+    register_resume_update_tools(mcp)
     register_employer_tools(mcp)
     register_response_tools(mcp)
 
