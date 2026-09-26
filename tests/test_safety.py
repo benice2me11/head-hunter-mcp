@@ -2,6 +2,7 @@
 import copy
 from datetime import datetime, timedelta, timezone
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -96,6 +97,17 @@ class EncodingTests(unittest.TestCase):
         for change in [{'letter': ''}, {'task_unknown': 'unreviewed'}, {'resume_id': 'b' * 40}]:
             with self.subTest(change=change):
                 self.assertFalse(matches_application(fields | change, CONTENT))
+
+    def test_form_newlines_preserve_reviewed_letter_and_answer_text(self):
+        expected = CONTENT | {'question_answers': {'task_1': 'First\nSecond'}}
+        fields = {'vacancy_id': CONTENT['vacancy_id'], 'resume_hash': CONTENT['resume_id'],
+                  'letter': CONTENT['cover_letter'].replace('\n', '\r\n'), 'task_1': 'First\r\nSecond'}
+        self.assertTrue(matches_application(fields, expected))
+        for changed in [fields['letter'] + ' ', fields['letter'] + '\r\n', fields['letter'].replace('\r\n', ' '),
+                        fields['letter'].replace('\r\n', '\r')]:
+            with self.subTest(changed=changed):
+                self.assertFalse(matches_application(fields | {'letter': changed}, expected))
+        self.assertFalse(matches_application(fields | {'task_1': 'First\r\nChanged'}, expected))
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -197,9 +209,26 @@ class BrowserSafetyTests(unittest.IsolatedAsyncioTestCase):
         if self.scenario == 'one_click':
             open_action = "fetch('/applicant/vacancy_response/popup', {method:'POST',body:new URLSearchParams(new FormData(form))}).catch(()=>{});"
         mutate = "body.set('resume_hash','" + 'b' * 40 + "');" if self.scenario == 'wrong_payload' else ''
-        return (html.replace('EMPLOYER', employer).replace('WRONG_ID', 'b' * 40)
+        html = (html.replace('EMPLOYER', employer).replace('WRONG_ID', 'b' * 40)
                 .replace('APPROVED_ID', CONTENT['resume_id']).replace('LETTER', letter)
                 .replace('QUESTION', question).replace('OPEN_ACTION', open_action).replace('MUTATE_PAYLOAD', mutate))
+        if self.scenario.startswith('modern_'):
+            title = 'Other resume' if self.scenario == 'modern_wrong_title' else CONTENT['resume_title']
+            warning_style = '' if self.scenario == 'modern_visible_warning' else 'max-height:0;overflow:hidden'
+            selected = (f'<div role="dialog"><div data-qa="resume-title">{title}</div></div>'
+                        f'<div data-qa="hidden-resume-warning" style="{warning_style}">Change resume visibility</div>')
+            html = re.sub(r'<select name="resume_hash">.*?</select>', selected, html, flags=re.S)
+            html = html.replace('<textarea name="letter"></textarea>',
+                '<button type="button" data-qa="add-cover-letter" onclick="setTimeout(() => document.querySelector(\'textarea\').hidden=false, 50)">Add letter</button>'
+                '<textarea data-qa="vacancy-response-popup-form-letter-input" hidden></textarea>')
+            outgoing_id = 'b' * 40 if self.scenario == 'modern_wrong_payload' else CONTENT['resume_id']
+            html = html.replace('const body = new URLSearchParams(new FormData(form));',
+                'const body = new URLSearchParams(new FormData(form));'
+                f'body.set("resume_hash", "{outgoing_id}");'
+                'body.set("letter", document.querySelector("textarea").value);')
+            if self.scenario == 'modern_multipart':
+                html = html.replace('new URLSearchParams(new FormData(form))', 'new FormData(form)')
+        return html
 
     async def serve_fixture(self, route):
         request = route.request
@@ -209,7 +238,11 @@ class BrowserSafetyTests(unittest.IsolatedAsyncioTestCase):
         elif request.method == 'GET' and parsed.path == '/vacancy/123456':
             await route.fulfill(status=200, content_type='text/html', body=self.fixture_html())
         elif request.method == 'POST' and parsed.path == '/applicant/vacancy_response/popup':
-            self.posts.append(parse_qs(request.post_data, keep_blank_values=True))
+            if 'multipart/form-data' in request.headers.get('content-type', ''):
+                fields = parse_fields(request.post_data_buffer, request.headers['content-type'])
+                self.posts.append({k: [v] for k, v in fields.items()})
+            else:
+                self.posts.append(parse_qs(request.post_data, keep_blank_values=True))
             await route.fulfill(status=200, content_type='application/json', body='{"success":true}')
         else:
             await route.abort()
@@ -237,6 +270,37 @@ class BrowserSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_payload_resume_tampering_sends_nothing(self):
         result = await self.run_application('wrong_payload')
         self.assertEqual(result['status'], 'blocked', result)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.dispatched, 0)
+
+    async def test_modern_selected_resume_and_delayed_letter_are_verified(self):
+        result = await self.run_application('modern_success')
+        self.assertEqual(result['status'], 'success', result)
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.posts[0]['resume_hash'], [CONTENT['resume_id']])
+        self.assertEqual(self.posts[0]['letter'], [CONTENT['cover_letter']])
+
+    async def test_modern_title_cannot_override_wrong_outgoing_resume_id(self):
+        result = await self.run_application('modern_wrong_payload')
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.dispatched, 0)
+
+    async def test_browser_multipart_newline_serialization_sends_exact_text_once(self):
+        result = await self.run_application('modern_multipart')
+        self.assertEqual(result['status'], 'success', result)
+        self.assertEqual(self.dispatched, 1)
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.posts[0]['letter'], [CONTENT['cover_letter'].replace('\n', '\r\n')])
+
+    async def test_modern_unapproved_selected_title_sends_nothing(self):
+        result = await self.run_application('modern_wrong_title')
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertEqual(self.posts, [])
+
+    async def test_visible_privacy_warning_stops_before_dispatch(self):
+        result = await self.run_application('modern_visible_warning')
+        self.assertEqual(result['blocker'], 'resume_visibility_review_required', result)
         self.assertEqual(self.posts, [])
         self.assertEqual(self.dispatched, 0)
 

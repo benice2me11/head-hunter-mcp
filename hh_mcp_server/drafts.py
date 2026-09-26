@@ -55,7 +55,8 @@ def load_confirmed_draft(draft_id: str, approved_digest: str, confirmed: bool) -
         raise ValueError("Draft has already been dispatched or completed. Check history; do not resend.")
     if draft["digest"] != approved_digest or content_digest(draft["content"]) != approved_digest:
         raise ValueError("Application content changed after review; prepare and confirm a new draft.")
-    if datetime.now(timezone.utc) - datetime.fromisoformat(draft["created_at"]) > timedelta(hours=24):
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(draft["created_at"])
+    if not timedelta(0) <= age < timedelta(hours=24):
         raise ValueError("Draft expired. Recheck the vacancy and obtain confirmation for a fresh draft.")
     validate_ids(draft["content"]["vacancy_id"], draft["content"]["resume_id"])
     return draft
