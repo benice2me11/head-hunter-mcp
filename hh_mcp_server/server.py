@@ -25,7 +25,10 @@ class SingleBrowserOperation(Middleware):
 
     async def on_call_tool(self, context, call_next):
         async with self.lock:
-            return await call_next(context)
+            try:
+                return await call_next(context)
+            finally:
+                await close_browser()
 
 
 @asynccontextmanager
