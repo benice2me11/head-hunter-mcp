@@ -89,6 +89,27 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["task_stack"], "go")
         self.assertIn("multiple selection", questions[0]["control_semantics_warning"])
 
+    async def test_hidden_conditional_textarea_is_not_force_filled(self):
+        await self.page.set_content(
+            """
+            <div data-qa="task-body">
+              <h3>AI workflow</h3>
+              <label><input type="radio" name="task_ai" value="yes" checked>Yes</label>
+              <label><input type="radio" name="task_ai" value="open">Custom</label>
+              <textarea name="task_ai_text" style="display:none"></textarea>
+            </div>
+            """
+        )
+        questions, incomplete, payload = await questions_and_fill(
+            self.page,
+            {"task_ai": "Yes", "task_ai_text": "Detailed workflow"},
+        )
+        by_name = {question["name"]: question for question in questions}
+        self.assertFalse(by_name["task_ai_text"]["active"])
+        self.assertTrue(incomplete)
+        self.assertNotIn("task_ai_text", payload)
+        self.assertEqual(await self.page.locator('[name="task_ai_text"]').input_value(), "")
+
     async def test_unknown_or_unmatched_answer_is_incomplete(self):
         await self.page.set_content(
             '<label><input type="radio" name="task_backend" value="go">Golang</label>'

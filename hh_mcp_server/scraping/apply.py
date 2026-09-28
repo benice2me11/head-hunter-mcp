@@ -69,6 +69,7 @@ async def questions_and_fill(page, approved_answers):
         kind = await control.get_attribute('type') or tag
         if kind == 'hidden':
             continue
+        active = await control.is_visible()
         option_label = await control.evaluate(
             "(e) => e.labels?.[0]?.innerText || e.getAttribute('aria-label') || e.value || e.name"
         )
@@ -84,6 +85,7 @@ async def questions_and_fill(page, approved_answers):
                 'question': (question_label or name)[:1000],
                 'options': [],
                 'control_semantics_warning': None,
+                'active': active,
             },
         )
         question_text = (question_label or '').casefold()
@@ -101,6 +103,12 @@ async def questions_and_fill(page, approved_answers):
                 group['options'].append(label[:500])
 
         if name not in approved_answers:
+            continue
+        if not active and kind not in {'radio', 'checkbox'}:
+            # HH uses hidden textareas for conditional "custom answer" fields.
+            # Never force-fill an inactive control: selecting its controller
+            # must make it visible first, otherwise the approved payload is
+            # internally inconsistent with the current form state.
             continue
         answer = approved_answers[name]
         if kind == 'radio':
@@ -141,6 +149,9 @@ async def questions_and_fill(page, approved_answers):
     for question in questions:
         name = question['name']
         if name not in approved_answers:
+            incomplete = True
+            continue
+        if question['type'] not in {'radio', 'checkbox'} and not question.get('active', True):
             incomplete = True
             continue
         if question['type'] == 'radio':
