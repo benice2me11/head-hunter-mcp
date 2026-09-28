@@ -130,7 +130,7 @@ async def questions_and_fill(page, approved_answers):
                 raise ValueError('Approved select answer could not be verified.')
             payload_answers[name] = await control.input_value()
         else:
-            await control.fill(str(answer))
+            await control.fill(str(answer), force=True)
             if await control.input_value() != str(answer):
                 raise ValueError('Approved questionnaire answer could not be verified.')
             payload_answers[name] = str(answer)
@@ -345,7 +345,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
     except Exception as error:
         return {'status': 'unverified' if guard.dispatched else 'blocked',
                 'reason': 'Application interrupted; check history before retrying.' if guard.dispatched else 'Form interaction failed; no approved request was dispatched.',
-                'error_type': type(error).__name__, 'stage': stage}
+                'error_type': type(error).__name__, 'error_detail': str(error), 'stage': stage}
     finally:
         page.remove_listener('response', guard.observe_response)
         # Stop delayed page scripts before removing the request guard. If closing
