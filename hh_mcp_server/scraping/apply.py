@@ -252,7 +252,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
         submit = await visible(page, [S.SUBMIT_BUTTON])
         if submit is None or not await submit.is_enabled():
             return {'status': 'blocked', 'reason': 'Submission is unavailable or the form is incomplete.'}
-        if 'vacancy_snapshot' in content:
+        if 'vacancy_snapshot' in content and '/applicant/vacancy_response' not in page.url:
             current = vacancy_snapshot(await extract_vacancy_page(page, content['vacancy_id']))
             if current != content['vacancy_snapshot']:
                 return {'status': 'blocked', 'reason': 'Vacancy terms changed while filling the form; review a new draft.'}

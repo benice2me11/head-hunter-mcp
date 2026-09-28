@@ -2,7 +2,7 @@ import unittest
 
 from playwright.async_api import async_playwright
 
-from hh_mcp_server.scraping.apply import questions_and_fill
+from hh_mcp_server.scraping.apply import questions_and_fill, select_resume
 from hh_mcp_server.submission_guard import matches_application, parse_fields
 
 
@@ -98,6 +98,19 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(incomplete)
         self.assertEqual(payload, {})
+
+    async def test_full_page_selected_resume_title_is_accepted(self):
+        resume_id = "a" * 40
+        await self.page.set_content(
+            '<div data-qa="resume-title">Fullstack / Product Engineer (Go, React, AI)</div>'
+        )
+        self.assertTrue(
+            await select_resume(
+                self.page,
+                resume_id,
+                "Fullstack / Product Engineer (Go, React, AI)",
+            )
+        )
 
 
 class SubmissionQuestionPayloadTests(unittest.TestCase):
