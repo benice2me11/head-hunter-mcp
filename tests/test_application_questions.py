@@ -106,7 +106,7 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
         )
         by_name = {question["name"]: question for question in questions}
         self.assertFalse(by_name["task_ai_text"]["active"])
-        self.assertTrue(incomplete)
+        self.assertFalse(incomplete)
         self.assertNotIn("task_ai_text", payload)
         self.assertEqual(await self.page.locator('[name="task_ai_text"]').input_value(), "")
 

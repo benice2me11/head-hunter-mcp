@@ -152,7 +152,10 @@ async def questions_and_fill(page, approved_answers):
             incomplete = True
             continue
         if question['type'] not in {'radio', 'checkbox'} and not question.get('active', True):
-            incomplete = True
+            # Conditional controls (for example HH's custom-answer textarea)
+            # are present in the DOM even when their controller keeps them
+            # inactive. They must not block a draft that deliberately selected
+            # another option, and they must not be included in the payload.
             continue
         if question['type'] == 'radio':
             if await page.locator(f'input[name="{name}"]:checked').count() != 1:
