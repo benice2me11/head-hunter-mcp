@@ -46,7 +46,8 @@ def parse_fields(body: bytes, content_type: str) -> dict[str, str | list[str]]:
 
 
 def matches_application(fields: dict[str, str | list[str]], expected: dict,
-                        question_payload_answers: dict | None = None) -> bool:
+                        question_payload_answers: dict | None = None,
+                        optional_empty_question_fields: set[str] | None = None) -> bool:
     def same_text(actual: str | None, approved: str) -> bool:
         # Browser form serialization converts textarea LF to CRLF. Preserve
         # every other character, including leading/trailing spaces and lines.
@@ -71,7 +72,17 @@ def matches_application(fields: dict[str, str | list[str]], expected: dict,
         elif isinstance(actual, list) or not same_text(actual, str(value)):
             return False
     # Unknown questionnaire answers must never be submitted automatically.
-    if any(name.startswith("task_") and name not in answers for name in fields):
+    optional_empty = optional_empty_question_fields or set()
+    for name, actual in fields.items():
+        if not name.startswith("task_") or name in answers:
+            continue
+        if name in optional_empty:
+            if isinstance(actual, list):
+                if any(item != "" for item in actual):
+                    return False
+            elif actual != "":
+                return False
+            continue
         return False
     return True
 
@@ -86,6 +97,7 @@ class SubmissionGuard:
         self.error = None
         self.request = None
         self.question_payload_answers = None
+        self.optional_empty_question_fields = set()
 
     async def handle(self, route):
         request = route.request
@@ -106,7 +118,12 @@ class SubmissionGuard:
             else:
                 try:
                     fields = parse_fields(request.post_data_buffer or b"", request.headers.get("content-type", ""))
-                    if not matches_application(fields, self.expected, self.question_payload_answers):
+                    if not matches_application(
+                        fields,
+                        self.expected,
+                        self.question_payload_answers,
+                        self.optional_empty_question_fields,
+                    ):
                         raise ValueError("Payload differs from the approved resume, vacancy, letter or answers.")
                     self.on_dispatch()
                     self.dispatched = True

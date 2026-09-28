@@ -60,6 +60,7 @@ async def select_resume(page, resume_id, resume_title):
 async def questions_and_fill(page, approved_answers):
     groups = {}
     payload_answers = {}
+    inactive_answer_names = set()
     controls = await page.locator('textarea[name^="task_"], input[name^="task_"], select[name^="task_"]').all()
     for control in controls:
         name = await control.get_attribute('name')
@@ -109,6 +110,8 @@ async def questions_and_fill(page, approved_answers):
             # Never force-fill an inactive control: selecting its controller
             # must make it visible first, otherwise the approved payload is
             # internally inconsistent with the current form state.
+            if name in approved_answers:
+                inactive_answer_names.add(name)
             continue
         answer = approved_answers[name]
         if kind == 'radio':
@@ -164,7 +167,7 @@ async def questions_and_fill(page, approved_answers):
             if await page.locator(f'input[name="{name}"]:checked').count() == 0:
                 incomplete = True
     extra = set(approved_answers) - present_names
-    return questions, incomplete or bool(extra), payload_answers
+    return questions, incomplete or bool(extra), payload_answers, inactive_answer_names
 
 
 async def inspect_application_form(page: Page, vacancy_id: str) -> dict:
@@ -185,7 +188,7 @@ async def inspect_application_form(page: Page, vacancy_id: str) -> dict:
             await page.wait_for_selector(S.SUBMIT_BUTTON, timeout=5000)
         except BrowserTimeout:
             return {'status': 'blocked', 'reason': guard.error or 'No verifiable application form.', 'url': url}
-        questions, _, _ = await questions_and_fill(page, {})
+        questions, _, _, _ = await questions_and_fill(page, {})
         resume_candidates = []
         for candidate in await page.locator('[data-qa*="resume"]').all():
             if not await candidate.is_visible():
@@ -276,7 +279,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
         if await visible(page, ['[data-qa="relocation-warning-confirm"]']):
             return {'status': 'blocked', 'reason': 'Relocation warning requires separate user review.'}
         stage = 'fill_questions'
-        questions, incomplete, payload_answers = await questions_and_fill(
+        questions, incomplete, payload_answers, inactive_answer_names = await questions_and_fill(
             page, content.get('question_answers') or {}
         )
         if incomplete:
@@ -298,6 +301,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
                 return {'status': 'blocked', 'reason': 'Vacancy terms changed while filling the form; review a new draft.'}
         stage = 'submit'
         guard.question_payload_answers = payload_answers
+        guard.optional_empty_question_fields = inactive_answer_names
         guard.commit = True
         await submit.click()
         for _ in range(50):
@@ -309,7 +313,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             # HH may insert another questionnaire/confirmation step instead of
             # dispatching immediately. Surface the new state instead of
             # collapsing it into an ambiguous generic blocker.
-            next_questions, _, _ = await questions_and_fill(
+            next_questions, _, _, _ = await questions_and_fill(
                 page, content.get('question_answers') or {}
             )
             question_shape = lambda values: [

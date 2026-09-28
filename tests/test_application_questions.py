@@ -58,7 +58,7 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
             "task_workflow": "Daily AI-assisted development",
         }
 
-        questions, incomplete, payload = await questions_and_fill(self.page, answers)
+        questions, incomplete, payload, inactive = await questions_and_fill(self.page, answers)
 
         self.assertFalse(incomplete)
         by_name = {question["name"]: question for question in questions}
@@ -71,6 +71,7 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["task_level"], "senior")
         self.assertEqual(payload["task_city"], "Moscow")
         self.assertEqual(payload["task_workflow"], "Daily AI-assisted development")
+        self.assertEqual(inactive, set())
 
     async def test_radio_multiple_wording_emits_semantics_warning(self):
         await self.page.set_content(
@@ -82,11 +83,12 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
             </div>
             """
         )
-        questions, incomplete, payload = await questions_and_fill(
+        questions, incomplete, payload, inactive = await questions_and_fill(
             self.page, {"task_stack": "Golang"}
         )
         self.assertFalse(incomplete)
         self.assertEqual(payload["task_stack"], "go")
+        self.assertEqual(inactive, set())
         self.assertIn("multiple selection", questions[0]["control_semantics_warning"])
 
     async def test_hidden_conditional_textarea_is_not_force_filled(self):
@@ -100,7 +102,7 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
             </div>
             """
         )
-        questions, incomplete, payload = await questions_and_fill(
+        questions, incomplete, payload, inactive = await questions_and_fill(
             self.page,
             {"task_ai": "Yes", "task_ai_text": "Detailed workflow"},
         )
@@ -108,17 +110,19 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(by_name["task_ai_text"]["active"])
         self.assertFalse(incomplete)
         self.assertNotIn("task_ai_text", payload)
+        self.assertEqual(inactive, {"task_ai_text"})
         self.assertEqual(await self.page.locator('[name="task_ai_text"]').input_value(), "")
 
     async def test_unknown_or_unmatched_answer_is_incomplete(self):
         await self.page.set_content(
             '<label><input type="radio" name="task_backend" value="go">Golang</label>'
         )
-        _, incomplete, payload = await questions_and_fill(
+        _, incomplete, payload, inactive = await questions_and_fill(
             self.page, {"task_backend": "Rust", "task_unknown": "x"}
         )
         self.assertTrue(incomplete)
         self.assertEqual(payload, {})
+        self.assertEqual(inactive, set())
 
     async def test_full_page_selected_resume_title_is_accepted(self):
         resume_id = "a" * 40
@@ -178,6 +182,55 @@ class SubmissionQuestionPayloadTests(unittest.TestCase):
             "application/x-www-form-urlencoded",
         )
         self.assertEqual(parsed["task_tools"], ["codex", "mcp"])
+
+    def test_inactive_conditional_field_may_be_serialized_empty(self):
+        fields = {
+            "vacancy_id": "123",
+            "resume_hash": "a" * 40,
+            "letter": "hello",
+            "task_ai": "yes",
+            "task_ai_text": "",
+        }
+        expected = {
+            "vacancy_id": "123",
+            "resume_id": "a" * 40,
+            "cover_letter": "hello",
+            "question_answers": {
+                "task_ai": "Yes",
+                "task_ai_text": "Detailed workflow",
+            },
+        }
+        self.assertTrue(
+            matches_application(
+                fields,
+                expected,
+                question_payload_answers={"task_ai": "yes"},
+                optional_empty_question_fields={"task_ai_text"},
+            )
+        )
+
+    def test_inactive_conditional_field_rejects_nonempty_payload(self):
+        fields = {
+            "vacancy_id": "123",
+            "resume_hash": "a" * 40,
+            "letter": "hello",
+            "task_ai": "yes",
+            "task_ai_text": "unexpected",
+        }
+        expected = {
+            "vacancy_id": "123",
+            "resume_id": "a" * 40,
+            "cover_letter": "hello",
+            "question_answers": {"task_ai": "Yes"},
+        }
+        self.assertFalse(
+            matches_application(
+                fields,
+                expected,
+                question_payload_answers={"task_ai": "yes"},
+                optional_empty_question_fields={"task_ai_text"},
+            )
+        )
 
 
 if __name__ == "__main__":
