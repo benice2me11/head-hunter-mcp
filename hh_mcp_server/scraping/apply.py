@@ -36,6 +36,15 @@ async def select_resume(page, resume_id, resume_title):
     if await radio.count() == 1:
         await radio.check()
         return await radio.is_checked()
+    picker = page.locator('[role="button"]:has([data-qa="resume-title"])')
+    if await picker.count() == 1 and await picker.is_visible():
+        await picker.click(force=True)
+        option = page.locator(f'[data-qa="magritte-select-option-{resume_id}"]')
+        if await option.count() == 1:
+            await option.click(force=True)
+            selected = page.locator('[role="button"]:has([data-qa="resume-title"]) [data-qa="resume-title"]')
+            if await selected.count() == 1:
+                return normalized_text(await selected.inner_text()) == normalized_text(resume_title)
     current = page.locator('input[name="resume_hash"], input[name="resume_id"], input[name="resumeId"]')
     values = [await item.input_value() for item in await current.all()]
     if values:
@@ -96,7 +105,7 @@ async def questions_and_fill(page, approved_answers):
         answer = approved_answers[name]
         if kind == 'radio':
             if normalized_text(option_label or '') == normalized_text(str(answer)):
-                await control.check()
+                await control.check(force=True)
                 if not await control.is_checked():
                     raise ValueError('Approved radio answer could not be verified.')
                 payload_answers[name] = await control.input_value()
@@ -107,7 +116,7 @@ async def questions_and_fill(page, approved_answers):
                 for item in wanted
             )
             if should_check:
-                await control.check()
+                await control.check(force=True)
                 if not await control.is_checked():
                     raise ValueError('Approved checkbox answer could not be verified.')
                 payload_answers.setdefault(name, []).append(await control.input_value())
@@ -163,6 +172,15 @@ async def inspect_application_form(page: Page, vacancy_id: str) -> dict:
         except BrowserTimeout:
             return {'status': 'blocked', 'reason': guard.error or 'No verifiable application form.', 'url': url}
         questions, _, _ = await questions_and_fill(page, {})
+        resume_candidates = []
+        for candidate in await page.locator('[data-qa*="resume"]').all():
+            if not await candidate.is_visible():
+                continue
+            resume_candidates.append({
+                'data_qa': await candidate.get_attribute('data-qa'),
+                'tag': await candidate.evaluate('(e) => e.tagName.toLowerCase()'),
+                'text': (await candidate.inner_text())[:1000],
+            })
         return {
             'status': 'form_inspected',
             'url': url,
@@ -172,6 +190,7 @@ async def inspect_application_form(page: Page, vacancy_id: str) -> dict:
             'resume_visibility_warning': bool(await visible(page, [S.RESUME_VISIBILITY_WARNING])),
             'relocation_warning': bool(await visible(page, ['[data-qa="relocation-warning-confirm"]'])),
             'cover_letter_available': bool(await visible(page, [S.COVER_LETTER_INPUT, S.COVER_LETTER_TOGGLE])),
+            'resume_candidates': resume_candidates,
             'dispatch_attempted': guard.dispatched,
         }
     finally:
@@ -199,6 +218,7 @@ async def fill_letter(page, letter):
 
 
 async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
+    stage = 'open_vacancy'
     guard = SubmissionGuard(content, on_dispatch)
     context = page.context
     await context.route('**/*', guard.handle)
@@ -222,6 +242,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
         cookie = await visible(page, ['[data-qa="cookies-policy-informer-accept"]'])
         if cookie:
             await cookie.click()
+        stage = 'open_application_form'
         button = await visible(page, [S.APPLY_BUTTON])
         if button is None:
             return {'status': 'blocked', 'reason': 'Application control not found.'}
@@ -233,29 +254,35 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             return {'status': 'blocked', 'reason': guard.error or 'No verifiable application form. Manual review required.'}
         if guard.error:
             return {'status': 'blocked', 'reason': guard.error}
+        stage = 'inspect_blockers'
         warning = await visible(page, [S.RESUME_VISIBILITY_WARNING])
         if warning:
             return {'status': 'blocked', 'reason': 'HH requires a resume visibility change; obtain separate privacy approval.',
                     'blocker': 'resume_visibility_review_required', 'details': await warning.inner_text()}
         if await visible(page, ['[data-qa="relocation-warning-confirm"]']):
             return {'status': 'blocked', 'reason': 'Relocation warning requires separate user review.'}
+        stage = 'fill_questions'
         questions, incomplete, payload_answers = await questions_and_fill(
             page, content.get('question_answers') or {}
         )
         if incomplete:
             return {'status': 'questions_required', 'questions': questions,
                     'reason': 'Review the questions and prepare a new draft with approved answers.'}
+        stage = 'select_resume'
         if not await select_resume(page, content['resume_id'], content['resume_title']):
             return {'status': 'blocked', 'reason': 'The approved resume could not be selected and verified.'}
+        stage = 'fill_cover_letter'
         if not await fill_letter(page, content['cover_letter']):
             return {'status': 'blocked', 'reason': 'The approved cover letter could not be filled and verified.'}
         submit = await visible(page, [S.SUBMIT_BUTTON])
         if submit is None or not await submit.is_enabled():
             return {'status': 'blocked', 'reason': 'Submission is unavailable or the form is incomplete.'}
+        stage = 'pre_dispatch_snapshot'
         if 'vacancy_snapshot' in content and '/applicant/vacancy_response' not in page.url:
             current = vacancy_snapshot(await extract_vacancy_page(page, content['vacancy_id']))
             if current != content['vacancy_snapshot']:
                 return {'status': 'blocked', 'reason': 'Vacancy terms changed while filling the form; review a new draft.'}
+        stage = 'submit'
         guard.question_payload_answers = payload_answers
         guard.commit = True
         await submit.click()
@@ -263,6 +290,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             if guard.error or guard.response_status is not None:
                 break
             await asyncio.sleep(0.1)
+        stage = 'verify_dispatch'
         if not guard.dispatched:
             # HH may insert another questionnaire/confirmation step instead of
             # dispatching immediately. Surface the new state instead of
@@ -284,6 +312,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
         if guard.response_status is None or not 200 <= guard.response_status < 300:
             return {'status': 'unverified', 'reason': 'Request was dispatched but success is unverified. Check history before any retry.'}
         # A successful HTTP response alone is insufficient: reload the vacancy.
+        stage = 'verify_marker'
         await page.goto(url, wait_until='domcontentloaded')
         try:
             await page.wait_for_selector(S.ALREADY_APPLIED, timeout=8000)
@@ -316,7 +345,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
     except Exception as error:
         return {'status': 'unverified' if guard.dispatched else 'blocked',
                 'reason': 'Application interrupted; check history before retrying.' if guard.dispatched else 'Form interaction failed; no approved request was dispatched.',
-                'error_type': type(error).__name__}
+                'error_type': type(error).__name__, 'stage': stage}
     finally:
         page.remove_listener('response', guard.observe_response)
         # Stop delayed page scripts before removing the request guard. If closing

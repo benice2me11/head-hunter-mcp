@@ -112,6 +112,26 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_full_page_resume_picker_selects_exact_resume_id(self):
+        target = "a" * 40
+        other = "b" * 40
+        await self.page.set_content(
+            f"""
+            <div role="button" id="picker"><div data-qa="resume-title">Golang-разработчик</div></div>
+            <div data-qa="magritte-select-option-{other}">Golang-разработчик</div>
+            <div data-qa="magritte-select-option-{target}" onclick="
+              document.querySelector('[data-qa=resume-title]').textContent='Fullstack / Product Engineer (Go, React, AI)'
+            ">Fullstack / Product Engineer (Go, React, AI)</div>
+            """
+        )
+        self.assertTrue(
+            await select_resume(
+                self.page,
+                target,
+                "Fullstack / Product Engineer (Go, React, AI)",
+            )
+        )
+
 
 class SubmissionQuestionPayloadTests(unittest.TestCase):
     def test_semantic_radio_answer_can_map_to_exact_payload_value(self):
