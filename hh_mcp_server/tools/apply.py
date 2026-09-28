@@ -7,7 +7,7 @@ from hh_mcp_server.drivers.browser import get_page
 from hh_mcp_server.drafts import create_draft, load_confirmed_draft, save_draft, validate_ids
 from hh_mcp_server.ledger import Journal, draft_context, require_review
 from hh_mcp_server.opportunities import resolve_opportunity, require_available
-from hh_mcp_server.scraping.apply import apply_reviewed_draft
+from hh_mcp_server.scraping.apply import apply_reviewed_draft, inspect_application_form
 from hh_mcp_server.scraping.resume import get_my_resumes, parse_resume_page
 from hh_mcp_server.scraping.vacancy_detail import parse_vacancy_page
 from hh_mcp_server.snapshots import resume_snapshot, vacancy_snapshot
@@ -30,6 +30,19 @@ async def read_only_page():
 
 
 def register_apply_tools(mcp: FastMCP) -> None:
+    @mcp.tool(timeout=TOOL_TIMEOUT_SECONDS, title='Inspect Application Form',
+              annotations={'readOnlyHint': True, 'openWorldHint': True})
+    async def inspect_application(vacancy_id: str) -> dict[str, Any]:
+        """Inspect the current HH application form without sending anything.
+
+        Returns structured questionnaire controls and blockers so questions can
+        be reviewed before preparing a sendable application draft.
+        """
+        validate_ids(vacancy_id, '0' * 40)
+        page = await get_page()
+        await ensure_authenticated(page)
+        return await inspect_application_form(page, vacancy_id)
+
     @mcp.tool(timeout=TOOL_TIMEOUT_SECONDS, title='Prepare Application', annotations={'readOnlyHint': True, 'openWorldHint': True})
     async def prepare_application(vacancy_id: str, resume_id: str, cover_letter: str,
                                   question_answers: dict[str, str] | None = None) -> dict[str, Any]:

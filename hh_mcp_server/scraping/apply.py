@@ -3,6 +3,7 @@ import asyncio
 from playwright.async_api import Page, TimeoutError as BrowserTimeout
 from hh_mcp_server.constants import BASE_URL
 from hh_mcp_server.scraping import selectors as S
+from hh_mcp_server.scraping.responses import get_my_responses
 from hh_mcp_server.submission_guard import SubmissionGuard
 from hh_mcp_server.scraping.vacancy_detail import extract_vacancy_page
 from hh_mcp_server.snapshots import normalized_label, normalized_text, vacancy_snapshot
@@ -48,22 +49,135 @@ async def select_resume(page, resume_id, resume_title):
 
 
 async def questions_and_fill(page, approved_answers):
-    questions = []
+    groups = {}
+    payload_answers = {}
     controls = await page.locator('textarea[name^="task_"], input[name^="task_"], select[name^="task_"]').all()
     for control in controls:
         name = await control.get_attribute('name')
+        if not name:
+            continue
         tag = await control.evaluate('(e) => e.tagName.toLowerCase()')
         kind = await control.get_attribute('type') or tag
-        label = await control.evaluate("(e) => e.labels?.[0]?.innerText || e.closest('[data-qa=task-body]')?.innerText || e.getAttribute('aria-label') || e.name")
-        questions.append({'name': name, 'label': label[:1000], 'type': kind})
-        if name not in approved_answers or tag != 'textarea':
+        if kind == 'hidden':
             continue
-        await control.fill(approved_answers[name])
-        if await control.input_value() != approved_answers[name]:
-            raise ValueError('Approved questionnaire answer could not be verified.')
-    incomplete = any(q['name'] not in approved_answers or q['type'] != 'textarea' for q in questions)
-    extra = set(approved_answers) - {q['name'] for q in questions}
-    return questions, incomplete or bool(extra)
+        option_label = await control.evaluate(
+            "(e) => e.labels?.[0]?.innerText || e.getAttribute('aria-label') || e.value || e.name"
+        )
+        question_label = await control.evaluate(
+            "(e) => e.closest('[data-qa=task-body]')?.querySelector('legend, h1, h2, h3, h4, [data-qa*=title]')?.innerText || "
+            "e.closest('[data-qa=task-body]')?.innerText || e.getAttribute('aria-label') || e.name"
+        )
+        group = groups.setdefault(
+            name,
+            {
+                'name': name,
+                'type': kind,
+                'question': (question_label or name)[:1000],
+                'options': [],
+                'control_semantics_warning': None,
+            },
+        )
+        question_text = (question_label or '').casefold()
+        if kind == 'radio' and any(
+            marker in question_text
+            for marker in ('можно выбрать несколько', 'выберите несколько', 'несколько вариантов')
+        ):
+            group['control_semantics_warning'] = (
+                'Question text suggests multiple selection, but HH currently renders '
+                'same-name radio controls; only one option can be selected in this DOM.'
+            )
+        if kind in {'radio', 'checkbox'}:
+            label = (option_label or '').strip()
+            if label and label not in group['options']:
+                group['options'].append(label[:500])
+
+        if name not in approved_answers:
+            continue
+        answer = approved_answers[name]
+        if kind == 'radio':
+            if normalized_text(option_label or '') == normalized_text(str(answer)):
+                await control.check()
+                if not await control.is_checked():
+                    raise ValueError('Approved radio answer could not be verified.')
+                payload_answers[name] = await control.input_value()
+        elif kind == 'checkbox':
+            wanted = answer if isinstance(answer, list) else [answer]
+            should_check = any(
+                normalized_text(option_label or '') == normalized_text(str(item))
+                for item in wanted
+            )
+            if should_check:
+                await control.check()
+                if not await control.is_checked():
+                    raise ValueError('Approved checkbox answer could not be verified.')
+                payload_answers.setdefault(name, []).append(await control.input_value())
+        elif tag == 'select':
+            try:
+                await control.select_option(label=str(answer))
+            except Exception:
+                await control.select_option(str(answer))
+            selected = await control.locator('option:checked').inner_text()
+            if normalized_text(selected) != normalized_text(str(answer)):
+                raise ValueError('Approved select answer could not be verified.')
+            payload_answers[name] = await control.input_value()
+        else:
+            await control.fill(str(answer))
+            if await control.input_value() != str(answer):
+                raise ValueError('Approved questionnaire answer could not be verified.')
+            payload_answers[name] = str(answer)
+
+    questions = list(groups.values())
+    present_names = set(groups)
+    incomplete = False
+    for question in questions:
+        name = question['name']
+        if name not in approved_answers:
+            incomplete = True
+            continue
+        if question['type'] == 'radio':
+            if await page.locator(f'input[name="{name}"]:checked').count() != 1:
+                incomplete = True
+        elif question['type'] == 'checkbox':
+            if await page.locator(f'input[name="{name}"]:checked').count() == 0:
+                incomplete = True
+    extra = set(approved_answers) - present_names
+    return questions, incomplete or bool(extra), payload_answers
+
+
+async def inspect_application_form(page: Page, vacancy_id: str) -> dict:
+    """Open the response form under a network guard and describe it without dispatching."""
+    guard = SubmissionGuard({}, lambda: None)
+    context = page.context
+    await context.route('**/*', guard.handle)
+    url = f"{BASE_URL}/vacancy/{vacancy_id}"
+    try:
+        await page.goto(url, wait_until='domcontentloaded')
+        if await page.locator(S.ALREADY_APPLIED).count():
+            return {'status': 'already_applied', 'url': url}
+        button = await visible(page, [S.APPLY_BUTTON])
+        if button is None:
+            return {'status': 'blocked', 'reason': 'Application control not found.', 'url': url}
+        await button.click()
+        try:
+            await page.wait_for_selector(S.SUBMIT_BUTTON, timeout=5000)
+        except BrowserTimeout:
+            return {'status': 'blocked', 'reason': guard.error or 'No verifiable application form.', 'url': url}
+        questions, _, _ = await questions_and_fill(page, {})
+        return {
+            'status': 'form_inspected',
+            'url': url,
+            'questions': questions,
+            'question_count': len(questions),
+            'requires_questions': bool(questions),
+            'resume_visibility_warning': bool(await visible(page, [S.RESUME_VISIBILITY_WARNING])),
+            'relocation_warning': bool(await visible(page, ['[data-qa="relocation-warning-confirm"]'])),
+            'cover_letter_available': bool(await visible(page, [S.COVER_LETTER_INPUT, S.COVER_LETTER_TOGGLE])),
+            'dispatch_attempted': guard.dispatched,
+        }
+    finally:
+        await page.close()
+        if page.is_closed():
+            await context.unroute('**/*', guard.handle)
 
 
 async def fill_letter(page, letter):
@@ -125,7 +239,9 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
                     'blocker': 'resume_visibility_review_required', 'details': await warning.inner_text()}
         if await visible(page, ['[data-qa="relocation-warning-confirm"]']):
             return {'status': 'blocked', 'reason': 'Relocation warning requires separate user review.'}
-        questions, incomplete = await questions_and_fill(page, content.get('question_answers') or {})
+        questions, incomplete, payload_answers = await questions_and_fill(
+            page, content.get('question_answers') or {}
+        )
         if incomplete:
             return {'status': 'questions_required', 'questions': questions,
                     'reason': 'Review the questions and prepare a new draft with approved answers.'}
@@ -140,6 +256,7 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             current = vacancy_snapshot(await extract_vacancy_page(page, content['vacancy_id']))
             if current != content['vacancy_snapshot']:
                 return {'status': 'blocked', 'reason': 'Vacancy terms changed while filling the form; review a new draft.'}
+        guard.question_payload_answers = payload_answers
         guard.commit = True
         await submit.click()
         for _ in range(50):
@@ -147,6 +264,22 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
                 break
             await asyncio.sleep(0.1)
         if not guard.dispatched:
+            # HH may insert another questionnaire/confirmation step instead of
+            # dispatching immediately. Surface the new state instead of
+            # collapsing it into an ambiguous generic blocker.
+            next_questions, _, _ = await questions_and_fill(
+                page, content.get('question_answers') or {}
+            )
+            question_shape = lambda values: [
+                (item['name'], item['type'], tuple(item.get('options') or []))
+                for item in values
+            ]
+            if next_questions and question_shape(next_questions) != question_shape(questions):
+                return {
+                    'status': 'additional_step_required',
+                    'questions': next_questions,
+                    'reason': 'HH showed another application step; review it before dispatch.',
+                }
             return {'status': 'blocked', 'reason': guard.error or 'No approved application request was sent.'}
         if guard.response_status is None or not 200 <= guard.response_status < 300:
             return {'status': 'unverified', 'reason': 'Request was dispatched but success is unverified. Check history before any retry.'}
@@ -156,7 +289,30 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
             await page.wait_for_selector(S.ALREADY_APPLIED, timeout=8000)
         except BrowserTimeout:
             return {'status': 'unverified', 'reason': 'HH has not visibly confirmed the application. Check history; do not retry automatically.'}
-        return {'status': 'success', 'url': url, 'verified_by': 'exact outgoing payload and application marker after reload'}
+        # Cross-check the canonical response history too. The vacancy marker is
+        # already strong evidence, so a lagging negotiations list is reported
+        # explicitly rather than turning a verified submission into uncertainty.
+        history_match = None
+        history_error = None
+        try:
+            history = await get_my_responses(page)
+            history_match = next(
+                (item for item in history.get('responses', []) if item.get('vacancy_id') == content['vacancy_id']),
+                None,
+            )
+        except Exception as error:
+            history_error = type(error).__name__
+        verified_by = ['exact_outgoing_payload', 'application_marker_after_reload']
+        if history_match:
+            verified_by.append('responses_exact_vacancy_id')
+        return {
+            'status': 'success',
+            'url': url,
+            'verified_by': verified_by,
+            'history_verification': 'confirmed' if history_match else 'pending_sync',
+            'response': history_match,
+            'history_error': history_error,
+        }
     except Exception as error:
         return {'status': 'unverified' if guard.dispatched else 'blocked',
                 'reason': 'Application interrupted; check history before retrying.' if guard.dispatched else 'Form interaction failed; no approved request was dispatched.',

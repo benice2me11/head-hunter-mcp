@@ -5,7 +5,7 @@ import json
 from urllib.parse import parse_qs, urlparse
 
 
-def parse_fields(body: bytes, content_type: str) -> dict[str, str]:
+def parse_fields(body: bytes, content_type: str) -> dict[str, str | list[str]]:
     def unique_object(pairs):
         result = {}
         for name, value in pairs:
@@ -21,9 +21,9 @@ def parse_fields(body: bytes, content_type: str) -> dict[str, str]:
         return {str(k): str(v) for k, v in value.items()}
     if "application/x-www-form-urlencoded" in content_type:
         value = parse_qs(body.decode(), keep_blank_values=True)
-        if any(len(v) != 1 for v in value.values()):
+        if any(len(items) > 1 and not name.startswith("task_") for name, items in value.items()):
             raise ValueError("Duplicate application form fields")
-        return {k: v[0] for k, v in value.items()}
+        return {k: v[0] if len(v) == 1 else v for k, v in value.items()}
     if "multipart/form-data" in content_type:
         message = BytesParser(policy=default).parsebytes(
             b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
@@ -31,14 +31,22 @@ def parse_fields(body: bytes, content_type: str) -> dict[str, str]:
         result = {}
         for part in message.iter_parts():
             name = part.get_param("name", header="content-disposition")
-            if not name or part.get_filename() or name in result:
-                raise ValueError("Unsupported or duplicate application field")
-            result[name] = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8")
+            if not name or part.get_filename():
+                raise ValueError("Unsupported application field")
+            value = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8")
+            if name in result:
+                if not name.startswith("task_"):
+                    raise ValueError("Duplicate application field")
+                current = result[name]
+                result[name] = current + [value] if isinstance(current, list) else [current, value]
+            else:
+                result[name] = value
         return result
     raise ValueError("Unsupported application encoding; no request sent")
 
 
-def matches_application(fields: dict[str, str], expected: dict) -> bool:
+def matches_application(fields: dict[str, str | list[str]], expected: dict,
+                        question_payload_answers: dict | None = None) -> bool:
     def same_text(actual: str | None, approved: str) -> bool:
         # Browser form serialization converts textarea LF to CRLF. Preserve
         # every other character, including leading/trailing spaces and lines.
@@ -54,9 +62,14 @@ def matches_application(fields: dict[str, str], expected: dict) -> bool:
     letters = [fields[name] for name in ("letter", "cover_letter", "coverLetter") if name in fields]
     if (letters and any(not same_text(value, expected["cover_letter"]) for value in letters)) or (not letters and expected["cover_letter"]):
         return False
-    answers = expected.get("question_answers") or {}
-    if any(not same_text(fields.get(name), value) for name, value in answers.items()):
-        return False
+    answers = question_payload_answers if question_payload_answers is not None else (expected.get("question_answers") or {})
+    for name, value in answers.items():
+        actual = fields.get(name)
+        if isinstance(value, list):
+            if not isinstance(actual, list) or sorted(actual) != sorted(str(item) for item in value):
+                return False
+        elif isinstance(actual, list) or not same_text(actual, str(value)):
+            return False
     # Unknown questionnaire answers must never be submitted automatically.
     if any(name.startswith("task_") and name not in answers for name in fields):
         return False
@@ -72,6 +85,7 @@ class SubmissionGuard:
         self.response_status = None
         self.error = None
         self.request = None
+        self.question_payload_answers = None
 
     async def handle(self, route):
         request = route.request
@@ -92,7 +106,7 @@ class SubmissionGuard:
             else:
                 try:
                     fields = parse_fields(request.post_data_buffer or b"", request.headers.get("content-type", ""))
-                    if not matches_application(fields, self.expected):
+                    if not matches_application(fields, self.expected, self.question_payload_answers):
                         raise ValueError("Payload differs from the approved resume, vacancy, letter or answers.")
                     self.on_dispatch()
                     self.dispatched = True
