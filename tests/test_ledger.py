@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,8 +22,9 @@ class LedgerTests(unittest.TestCase):
             journal.append('approved', CONTEXT, evidence_ref='fixture:user-message')
         with Journal(self.path) as journal:
             self.assertEqual(len(journal.events), 1)
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+        if os.name != 'nt':
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
 
     def test_competing_writer_is_rejected_without_lost_events(self):
         with Journal(self.path) as first:
@@ -55,7 +57,10 @@ class LedgerTests(unittest.TestCase):
         self.path.parent.mkdir()
         target = self.path.parent / 'other'
         target.write_text('private')
-        self.path.symlink_to(target)
+        try:
+            self.path.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f'Symlinks unavailable on this platform: {error}')
         with self.assertRaises(OSError):
             with Journal(self.path):
                 self.fail('Symlink followed')

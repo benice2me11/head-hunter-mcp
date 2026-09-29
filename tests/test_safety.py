@@ -2,6 +2,7 @@
 import copy
 from datetime import datetime, timedelta, timezone
 import json
+import os
 import re
 from pathlib import Path
 import tempfile
@@ -68,8 +69,9 @@ class DraftTests(unittest.TestCase):
 
     def test_private_permissions_and_valid_review(self):
         draft = drafts.create_draft(copy.deepcopy(CONTENT))
-        self.assertEqual(self.folder.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(drafts.draft_path(draft['draft_id']).stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':
+            self.assertEqual(self.folder.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(drafts.draft_path(draft['draft_id']).stat().st_mode & 0o777, 0o600)
         self.assertEqual(drafts.load_confirmed_draft(draft['draft_id'], draft['digest'], True), draft)
 
     def test_question_fields_cannot_override_destination(self):

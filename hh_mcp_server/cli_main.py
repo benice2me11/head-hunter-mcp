@@ -1,9 +1,19 @@
 import argparse
 import asyncio
 import logging
+import sys
+
+
+def configure_utf8_output() -> None:
+    """Keep CLI and stdio output Unicode-safe on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
 
 
 def main() -> None:
+    configure_utf8_output()
     parser = argparse.ArgumentParser(description="HH.ru MCP Server")
     parser.add_argument("--login", action="store_true", help="Launch browser for authentication")
     parser.add_argument("--no-headless", action="store_true", help="Run browser with visible window")

@@ -7,6 +7,7 @@ if os.environ.get("HH_ENV_FILE"):
     load_dotenv(os.environ["HH_ENV_FILE"], override=False)
 
 TOOL_TIMEOUT_SECONDS: float = 90.0
+SESSION_LOCK_WAIT_SECONDS: float = float(os.environ.get("HH_SESSION_LOCK_WAIT_SECONDS", "30"))
 BASE_URL = "https://hh.ru"
 STATE_FILE = Path(os.environ.get("HH_STATE_FILE", str(Path.home() / ".hh-mcp" / "profile" / "state.json"))).expanduser().resolve()
 PROFILE_DIR = STATE_FILE.parent

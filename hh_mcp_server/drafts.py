@@ -50,7 +50,7 @@ def save_draft(draft: dict) -> None:
 def load_confirmed_draft(draft_id: str, approved_digest: str, confirmed: bool) -> dict:
     if confirmed is not True:
         raise ValueError("User confirmation of this exact draft is required before any application action.")
-    draft = json.loads(draft_path(draft_id).read_text())
+    draft = json.loads(draft_path(draft_id).read_text(encoding="utf-8"))
     if draft["status"] != "prepared":
         raise ValueError("Draft has already been dispatched or completed. Check history; do not resend.")
     if draft["digest"] != approved_digest or content_digest(draft["content"]) != approved_digest:

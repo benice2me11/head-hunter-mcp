@@ -26,11 +26,12 @@ Write-операции намеренно fail-closed: неизвестная с
 ## Требования
 
 - Python 3.12;
-- macOS или Linux;
+- macOS, Linux или Windows;
 - Playwright Chromium.
 
-Для блокировки одновременного доступа к сессии используется `fcntl`, поэтому Windows
-сейчас не является поддерживаемой платформой.
+Для блокировки одновременного доступа к сессии и журналам используется
+неблокирующая локальная блокировка: `fcntl.flock` на POSIX и
+`msvcrt.locking` на Windows.
 
 ## Установка
 
@@ -49,6 +50,23 @@ python3.12 -m venv .venv
   --no-deps -e .
 
 .venv/bin/python -m playwright install chromium
+```
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/benice2me11/hh-mcp-server.git
+Set-Location hh-mcp-server
+
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip --isolated install `
+  --index-url https://pypi.org/simple `
+  --only-binary=:all: `
+  -r requirements.lock
+.\.venv\Scripts\python.exe -m pip --isolated install `
+  --index-url https://pypi.org/simple `
+  --no-deps -e .
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
 ## Авторизация
@@ -84,7 +102,9 @@ HH_ENV_FILE=/absolute/path/to/private/.env \
 сопоставления известных aliases/перепубликаций вакансий.
 
 Сессия, drafts и journals содержат приватные данные и не должны попадать в Git.
-Каталог профиля создаётся с правами `0700`, приватные файлы — `0600`.
+На POSIX каталог профиля создаётся с правами `0700`, приватные файлы — `0600`.
+На Windows файлы остаются внутри профиля текущего пользователя и используют
+унаследованный ACL профиля; POSIX mode bits там не считаются механизмом защиты.
 
 ## Подключение MCP
 

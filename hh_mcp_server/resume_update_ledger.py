@@ -1,13 +1,13 @@
 """Durable, process-safe journal for resume update attempts."""
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
-import fcntl
 import json
 import os
 from pathlib import Path
 import uuid
 
 from hh_mcp_server.constants import PROFILE_DIR
+from hh_mcp_server.platform_io import acquire_exclusive_lock, fsync_directory, open_private_rw
 from hh_mcp_server.private_files import private_directory
 
 
@@ -39,18 +39,14 @@ class ResumeUpdateJournal(AbstractContextManager):
 
     def __enter__(self):
         private_directory(self.path.parent)
-        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
         try:
-            self.lock_fd = os.open(self.path.with_suffix(".lock"), flags, 0o600)
-            os.fchmod(self.lock_fd, 0o600)
             try:
-                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.lock_fd = acquire_exclusive_lock(self.path.with_suffix(".lock"))
             except BlockingIOError:
                 raise ValueError(
                     "Resume update journal is in use; do not bypass its lock"
                 ) from None
-            fd = os.open(self.path, flags, 0o600)
-            os.fchmod(fd, 0o600)
+            fd = open_private_rw(self.path)
             self.handle = os.fdopen(fd, "r+", encoding="utf-8")
             seen = set()
             for line in self.handle:
@@ -114,11 +110,7 @@ class ResumeUpdateJournal(AbstractContextManager):
         self.handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
         self.handle.flush()
         os.fsync(self.handle.fileno())
-        directory_fd = os.open(self.path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(self.path.parent)
         self.events.append(event)
         return event
 
