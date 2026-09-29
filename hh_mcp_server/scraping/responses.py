@@ -24,57 +24,53 @@ def _status_code(data_qa: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-async def _extract_visible_responses(page: Page, *, deleted: bool, limit: int | None = None) -> list[dict]:
+async def _extract_visible_responses(
+    page: Page, *, deleted: bool, limit: int | None = None
+) -> list[dict]:
+    # Extract a whole page in one browser round-trip. Per-field Locator calls are
+    # noticeably expensive across dozens of HH response cards.
+    raw_items = await page.locator('[data-qa="negotiations-item-vacancy"]').evaluate_all(
+        """
+        (vacancies, limit) => vacancies.slice(0, limit ?? vacancies.length).map((vacancy) => {
+            const card = vacancy.closest('div:has([data-qa="negotiations-item-company"]):has([data-qa="negotiations-item-date"])');
+            if (!card) return null;
+            const vacancyLink = vacancy.closest('a');
+            const company = card.querySelector('[data-qa="negotiations-item-company"]');
+            const companyLink = company ? company.closest('a') : null;
+            const date = card.querySelector('[data-qa="negotiations-item-date"]');
+            const status = card.querySelector('[data-qa*="negotiations-tag"]');
+            return {
+                vacancy_href: vacancyLink?.getAttribute('href') ?? null,
+                title: vacancy.textContent?.trim() ?? '',
+                company_name: company?.textContent?.trim() ?? '',
+                company_href: companyLink?.getAttribute('href') ?? null,
+                applied_at: date?.textContent?.trim() ?? null,
+                status_text: status?.textContent?.trim() ?? null,
+                status_qa: status?.getAttribute('data-qa') ?? null,
+            };
+        }).filter(Boolean)
+        """,
+        limit,
+    )
+
     items: list[dict] = []
-    vacancies = page.locator('[data-qa="negotiations-item-vacancy"]')
-    vacancy_count = await vacancies.count()
-    if limit is not None:
-        vacancy_count = min(vacancy_count, limit)
-
-    for index in range(vacancy_count):
-        vacancy = vacancies.nth(index)
-        card = vacancy.locator(
-            'xpath=ancestor::div[.//*[@data-qa="negotiations-item-company"] and .//*[@data-qa="negotiations-item-date"]][1]'
-        )
-        if await card.count() != 1:
-            continue
-
-        vacancy_link = vacancy.locator("xpath=ancestor::a[1]")
-        vacancy_href = await vacancy_link.get_attribute("href")
-        vacancy_id = _id_from_href(vacancy_href, "vacancy")
+    for raw in raw_items:
+        vacancy_id = _id_from_href(raw["vacancy_href"], "vacancy")
         if not vacancy_id:
             continue
-
-        company = card.locator('[data-qa="negotiations-item-company"]')
-        company_name = (await company.inner_text()).strip() if await company.count() else ""
-        company_link = company.locator("xpath=ancestor::a[1]") if await company.count() else None
-        company_href = (
-            await company_link.get_attribute("href")
-            if company_link is not None and await company_link.count()
-            else None
-        )
-
-        date = card.locator('[data-qa="negotiations-item-date"]')
-        applied_at = (await date.inner_text()).strip() if await date.count() else None
-
-        status = card.locator('[data-qa*="negotiations-tag"]')
-        status_text = (await status.inner_text()).strip() if await status.count() else None
-        status_qa = await status.get_attribute("data-qa") if await status.count() else None
-
         items.append(
             {
                 "vacancy_id": vacancy_id,
                 "vacancy_url": f"{BASE_URL}/vacancy/{vacancy_id}",
-                "title": (await vacancy.inner_text()).strip(),
-                "employer": company_name or None,
-                "employer_id": _id_from_href(company_href, "employer"),
-                "status": status_text,
-                "status_code": _status_code(status_qa),
-                "applied_at": applied_at,
+                "title": raw["title"],
+                "employer": raw["company_name"] or None,
+                "employer_id": _id_from_href(raw["company_href"], "employer"),
+                "status": raw["status_text"],
+                "status_code": _status_code(raw["status_qa"]),
+                "applied_at": raw["applied_at"],
                 "deleted": deleted,
             }
         )
-
     return items
 
 
@@ -142,7 +138,9 @@ async def get_my_responses(
     await navigate_and_wait(page, url)
     await page.wait_for_timeout(800)
 
-    raw_text = await page.inner_text("body")
+    # raw_text exists for the legacy/full-history consumer. Bounded reads use
+    # structured cards only and avoid serializing the entire negotiations page.
+    raw_text = await page.inner_text("body") if limit is None else None
     tab_counts: dict[str, int] = {}
     for key, qa in (
         ("all", "tab_filter_all"),
