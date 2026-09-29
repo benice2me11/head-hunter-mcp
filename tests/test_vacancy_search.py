@@ -1,13 +1,18 @@
 """Regression tests for current hh.ru vacancy search markup."""
 import unittest
 from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import async_playwright
 
-from hh_mcp_server.scraping.vacancy_search import search_vacancies
+from hh_mcp_server.scraping.vacancy_search import build_search_url, search_vacancies
 
 
 class VacancySearchMarkupTests(unittest.IsolatedAsyncioTestCase):
+    def test_search_url_defaults_to_newest_first(self):
+        query = parse_qs(urlparse(build_search_url("Golang backend")).query)
+        self.assertEqual(query["order_by"], ["publication_time"])
+
     async def asyncSetUp(self):
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(headless=True)

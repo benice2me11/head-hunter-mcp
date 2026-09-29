@@ -23,7 +23,12 @@ def build_search_url(
     schedule: str | None = None,
     page: int = 0,
 ) -> str:
-    params: dict[str, str] = {"text": text, "page": str(page), "per_page": "20"}
+    params: dict[str, str] = {
+        "text": text,
+        "page": str(page),
+        "per_page": "20",
+        "order_by": "publication_time",
+    }
 
     if area:
         area_lower = area.lower().strip()
