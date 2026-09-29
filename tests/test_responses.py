@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from playwright.async_api import async_playwright
 
@@ -95,6 +95,57 @@ class ResponseScrapingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["vacancy_id"] for item in result["responses"]], ["2", "1"])
         self.assertEqual(result["active_count"], 2)
         self.assertEqual(result["deleted_count"], 0)
+
+
+    async def test_get_my_responses_keeps_deleted_history_and_deduplicates_each_bucket(self):
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        page.inner_text = AsyncMock(return_value="responses page")
+
+        labels = {
+            "tab_filter_all": "Все 2",
+            "tab_filter_deleted": "Удалённые 2",
+        }
+
+        def locator(selector):
+            item = MagicMock()
+            item.count = AsyncMock()
+            item.get_attribute = AsyncMock()
+            qa = selector.split('data-qa="', 1)[1].split('"', 1)[0] if 'data-qa="' in selector else ""
+            item.count.return_value = 1 if qa in labels else 0
+            item.get_attribute.return_value = labels.get(qa)
+            return item
+
+        page.locator.side_effect = locator
+        active = [
+            {"vacancy_id": "1", "deleted": False},
+            {"vacancy_id": "1", "deleted": False},
+            {"vacancy_id": "2", "deleted": False},
+        ]
+        deleted = [
+            {"vacancy_id": "1", "deleted": True},
+            {"vacancy_id": "3", "deleted": True},
+            {"vacancy_id": "3", "deleted": True},
+        ]
+
+        with (
+            patch(
+                "hh_mcp_server.scraping.responses.navigate_and_wait",
+                new=AsyncMock(),
+            ),
+            patch(
+                "hh_mcp_server.scraping.responses._collect_tab",
+                new=AsyncMock(side_effect=[active, deleted]),
+            ),
+        ):
+            result = await get_my_responses(page)
+
+        self.assertEqual(result["active_count"], 2)
+        self.assertEqual(result["deleted_count"], 2)
+        self.assertEqual(
+            [(item["vacancy_id"], item["deleted"]) for item in result["responses"]],
+            [("1", False), ("2", False), ("1", True), ("3", True)],
+        )
 
 
 if __name__ == "__main__":
