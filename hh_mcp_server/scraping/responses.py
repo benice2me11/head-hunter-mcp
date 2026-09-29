@@ -24,11 +24,14 @@ def _status_code(data_qa: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-async def _extract_visible_responses(page: Page, *, deleted: bool) -> list[dict]:
+async def _extract_visible_responses(page: Page, *, deleted: bool, limit: int | None = None) -> list[dict]:
     items: list[dict] = []
     vacancies = page.locator('[data-qa="negotiations-item-vacancy"]')
+    vacancy_count = await vacancies.count()
+    if limit is not None:
+        vacancy_count = min(vacancy_count, limit)
 
-    for index in range(await vacancies.count()):
+    for index in range(vacancy_count):
         vacancy = vacancies.nth(index)
         card = vacancy.locator(
             'xpath=ancestor::div[.//*[@data-qa="negotiations-item-company"] and .//*[@data-qa="negotiations-item-date"]][1]'
@@ -75,7 +78,13 @@ async def _extract_visible_responses(page: Page, *, deleted: bool) -> list[dict]
     return items
 
 
-async def _collect_tab(page: Page, *, tab_qa: str | None, deleted: bool) -> list[dict]:
+async def _collect_tab(
+    page: Page,
+    *,
+    tab_qa: str | None,
+    deleted: bool,
+    limit: int | None = None,
+) -> list[dict]:
     if tab_qa:
         tab = page.locator(f'button[data-qa="{tab_qa}"]')
         if await tab.count() == 0:
@@ -103,7 +112,14 @@ async def _collect_tab(page: Page, *, tab_qa: str | None, deleted: bool) -> list
         if current_page in seen_pages:
             break
         seen_pages.add(current_page)
-        results.extend(await _extract_visible_responses(page, deleted=deleted))
+        remaining = None if limit is None else max(limit - len(results), 0)
+        if remaining == 0:
+            break
+        results.extend(
+            await _extract_visible_responses(page, deleted=deleted, limit=remaining)
+        )
+        if limit is not None and len(results) >= limit:
+            break
 
         next_page = current_page + 1
         next_button = page.locator(f'button[data-qa^="number-pages-{next_page}"]')
@@ -119,7 +135,9 @@ async def _collect_tab(page: Page, *, tab_qa: str | None, deleted: bool) -> list
     return results
 
 
-async def get_my_responses(page: Page) -> dict:
+async def get_my_responses(
+    page: Page, *, limit: int | None = None, include_deleted: bool = True
+) -> dict:
     url = f"{BASE_URL}/applicant/negotiations"
     await navigate_and_wait(page, url)
     await page.wait_for_timeout(800)
@@ -140,8 +158,17 @@ async def get_my_responses(page: Page) -> dict:
             match = re.search(r"(\d+)\s*$", label)
             tab_counts[key] = int(match.group(1)) if match else 0
 
-    active = await _collect_tab(page, tab_qa="tab_filter_all", deleted=False)
-    deleted = await _collect_tab(page, tab_qa="tab_filter_deleted", deleted=True)
+    active = await _collect_tab(
+        page, tab_qa="tab_filter_all", deleted=False, limit=limit
+    )
+    deleted_limit = None if limit is None else max(limit - len(active), 0)
+    deleted = (
+        await _collect_tab(
+            page, tab_qa="tab_filter_deleted", deleted=True, limit=deleted_limit
+        )
+        if include_deleted and deleted_limit != 0
+        else []
+    )
 
     # Keep one row per exact HH vacancy and bucket. Deleted applications remain
     # useful for deduplication because deleting the card does not undo the fact
