@@ -66,5 +66,36 @@ class ResponseScrapingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status_code"], "interview")
 
 
+    async def test_get_my_responses_limit_stops_on_first_page(self):
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(
+            """
+            <html><body>
+              <button data-qa="tab_filter_all" aria-selected="true" aria-label="Все 30"></button>
+              <button data-qa="tab_filter_deleted" aria-label="Удалённые 49"></button>
+              <div><a href="/vacancy/2"><span data-qa="negotiations-item-vacancy">Second</span></a><a href="/employer/2"><div data-qa="negotiations-item-company">B</div></a><div data-qa="negotiations-item-date">сегодня</div></div>
+              <div><a href="/vacancy/1"><span data-qa="negotiations-item-vacancy">First</span></a><a href="/employer/1"><div data-qa="negotiations-item-company">A</div></a><div data-qa="negotiations-item-date">сегодня</div></div>
+              <button data-qa="number-pages-1" aria-current="true"></button>
+              <button data-qa="number-pages-2"></button>
+            </body></html>
+            """
+        )
+        try:
+            with patch(
+                "hh_mcp_server.scraping.responses.navigate_and_wait",
+                new=AsyncMock(),
+            ):
+                result = await get_my_responses(page, limit=2, include_deleted=False)
+        finally:
+            await browser.close()
+            await playwright.stop()
+
+        self.assertEqual([item["vacancy_id"] for item in result["responses"]], ["2", "1"])
+        self.assertEqual(result["active_count"], 2)
+        self.assertEqual(result["deleted_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

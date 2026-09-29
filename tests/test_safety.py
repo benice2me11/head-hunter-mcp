@@ -140,6 +140,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         page.locator.return_value.first.is_visible = AsyncMock(return_value=True)
         page.wait_for_selector = AsyncMock()
         await ensure_authenticated(page)
+        self.assertFalse(page.goto.called)
 
     async def test_current_profile_redirect_is_accepted(self):
         from unittest.mock import AsyncMock, Mock

@@ -32,10 +32,14 @@ async def check_authenticated(page: Page) -> bool:
 
 
 async def ensure_authenticated(page: Page) -> None:
+    # Reuse a positively identified protected page. This avoids a redundant
+    # navigation to /applicant/resumes before every tool call in one browser.
+    if urlparse(page.url).path.rstrip('/') in ACCOUNT_PATHS and await check_authenticated(page):
+        return
+
     # A public vacancy can contain a "my resumes" link even for a guest.
     # Verify access to the protected applicant page before trusting any marker.
-    if urlparse(page.url).path.rstrip('/') not in ACCOUNT_PATHS:
-        await page.goto(RESUMES_URL, wait_until="domcontentloaded")
+    await page.goto(RESUMES_URL, wait_until="domcontentloaded")
     try:
         await page.wait_for_selector(', '.join(ACCOUNT_MARKERS), timeout=10000)
     except Exception:
