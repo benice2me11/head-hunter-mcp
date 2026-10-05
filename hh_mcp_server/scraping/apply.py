@@ -1,5 +1,6 @@
 """UI application submission with payload validation and positive result checks."""
 import asyncio
+import logging
 from playwright.async_api import Page, TimeoutError as BrowserTimeout
 from hh_mcp_server.constants import BASE_URL
 from hh_mcp_server.scraping import selectors as S
@@ -7,6 +8,8 @@ from hh_mcp_server.scraping.responses import get_my_responses
 from hh_mcp_server.submission_guard import SubmissionGuard
 from hh_mcp_server.scraping.vacancy_detail import extract_vacancy_page
 from hh_mcp_server.snapshots import normalized_label, normalized_text, vacancy_snapshot
+
+logger = logging.getLogger(__name__)
 
 
 async def visible(page, selectors):
@@ -55,6 +58,61 @@ async def select_resume(page, resume_id, resume_title):
               if await item.is_visible()]
     return (len(titles) == 1
             and normalized_text(await titles[0].inner_text()) == normalized_text(resume_title))
+
+
+async def _resume_selector_closed(page, timeout_ms=1500):
+    for _ in range(max(1, timeout_ms // 100)):
+        if await visible(page, [S.RESUME_DROPDOWN_POPUP]) is None:
+            return True
+        await asyncio.sleep(0.1)
+    return await visible(page, [S.RESUME_DROPDOWN_POPUP]) is None
+
+
+async def _resume_selector_outside_click(page):
+    for selector in (S.APPLY_FORM, '[role="dialog"]'):
+        container = await visible(page, [selector])
+        if container is None:
+            continue
+        box = await container.bounding_box()
+        viewport = page.viewport_size
+        if not box or not viewport:
+            continue
+        # A point just inside the container's corner is form background, not a
+        # control. A raw mouse click lands on whatever is topmost there, which
+        # is the overlay itself when it still covers the form.
+        x = box['x'] + min(8.0, box['width'] / 2)
+        y = box['y'] + min(8.0, box['height'] / 2)
+        if 0 <= x < viewport['width'] and 0 <= y < viewport['height']:
+            await page.mouse.click(x, y)
+            return True
+    return False
+
+
+async def ensure_resume_selector_closed(page, resume_title):
+    """Dismiss an HH resume dropdown that stayed open after selection.
+
+    Idempotent: an already-closed selector is a no-op. Only Escape and a safe
+    click on the form container are attempted; controls are never force-clicked
+    through the overlay. Returns a blocked reason, or None once the form is
+    clear and the approved selection is still visible.
+    """
+    if await visible(page, [S.RESUME_DROPDOWN_POPUP]) is None:
+        return None
+    logger.info('resume_selector_open=true')
+    await page.keyboard.press('Escape')
+    if await _resume_selector_closed(page):
+        logger.info('resume_selector_dismiss=escape resume_selector_closed=true')
+    elif await _resume_selector_outside_click(page) and await _resume_selector_closed(page):
+        logger.info('resume_selector_dismiss=outside_click resume_selector_closed=true')
+    else:
+        logger.warning('resume_selector_closed=false stage=resume_selector_cleanup')
+        return 'The resume selector stayed open after selection; the form is unsafe to fill.'
+    titles = [item for item in await page.locator(S.SELECTED_RESUME_TITLE).all()
+              if await item.is_visible()]
+    if titles and (len(titles) != 1
+                   or normalized_text(await titles[0].inner_text()) != normalized_text(resume_title)):
+        return 'The approved resume selection was lost while closing the selector.'
+    return None
 
 
 async def questions_and_fill(page, approved_answers):
@@ -288,6 +346,11 @@ async def apply_reviewed_draft(page: Page, content: dict, on_dispatch) -> dict:
         stage = 'select_resume'
         if not await select_resume(page, content['resume_id'], content['resume_title']):
             return {'status': 'blocked', 'reason': 'The approved resume could not be selected and verified.'}
+        stage = 'resume_selector_cleanup'
+        reason = await ensure_resume_selector_closed(page, content['resume_title'])
+        if reason is not None:
+            return {'status': 'blocked', 'stage': stage, 'reason': reason,
+                    'dispatch_attempted': guard.dispatched}
         stage = 'fill_cover_letter'
         if not await fill_letter(page, content['cover_letter']):
             return {'status': 'blocked', 'reason': 'The approved cover letter could not be filled and verified.'}

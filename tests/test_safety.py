@@ -215,12 +215,7 @@ class BrowserSafetyTests(unittest.IsolatedAsyncioTestCase):
         html = (html.replace('EMPLOYER', employer).replace('WRONG_ID', 'b' * 40)
                 .replace('APPROVED_ID', CONTENT['resume_id']).replace('LETTER', letter)
                 .replace('QUESTION', question).replace('OPEN_ACTION', open_action).replace('MUTATE_PAYLOAD', mutate))
-        if self.scenario.startswith('modern_'):
-            title = 'Other resume' if self.scenario == 'modern_wrong_title' else CONTENT['resume_title']
-            warning_style = '' if self.scenario == 'modern_visible_warning' else 'max-height:0;overflow:hidden'
-            selected = (f'<div role="dialog"><div data-qa="resume-title">{title}</div></div>'
-                        f'<div data-qa="hidden-resume-warning" style="{warning_style}">Change resume visibility</div>')
-            html = re.sub(r'<select name="resume_hash">.*?</select>', selected, html, flags=re.S)
+        if self.scenario.startswith('modern_') or self.scenario.startswith('dropdown_'):
             html = html.replace('<textarea name="letter"></textarea>',
                 '<button type="button" data-qa="add-cover-letter" onclick="setTimeout(() => document.querySelector(\'textarea\').hidden=false, 50)">Add letter</button>'
                 '<textarea data-qa="vacancy-response-popup-form-letter-input" hidden></textarea>')
@@ -229,8 +224,47 @@ class BrowserSafetyTests(unittest.IsolatedAsyncioTestCase):
                 'const body = new URLSearchParams(new FormData(form));'
                 f'body.set("resume_hash", "{outgoing_id}");'
                 'body.set("letter", document.querySelector("textarea").value);')
+        if self.scenario.startswith('modern_'):
+            title = 'Other resume' if self.scenario == 'modern_wrong_title' else CONTENT['resume_title']
+            warning_style = '' if self.scenario == 'modern_visible_warning' else 'max-height:0;overflow:hidden'
+            selected = (f'<div role="dialog"><div data-qa="resume-title">{title}</div></div>'
+                        f'<div data-qa="hidden-resume-warning" style="{warning_style}">Change resume visibility</div>')
+            html = re.sub(r'<select name="resume_hash">.*?</select>', selected, html, flags=re.S)
             if self.scenario == 'modern_multipart':
                 html = html.replace('new URLSearchParams(new FormData(form))', 'new FormData(form)')
+        if self.scenario.startswith('dropdown_'):
+            # The drop-base overlay stays mounted over the letter toggle, so
+            # covered controls fail Playwright actionability checks until it
+            # is dismissed by Escape, an outside click, or not at all.
+            overlay_style = 'position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.01)'
+            if self.scenario == 'dropdown_stuck_outside':
+                # The overlay covers the picker and the letter toggle but not
+                # the form padding, so only a genuine outside click closes it.
+                overlay_style = 'position:fixed;top:120px;left:0;right:0;bottom:0;z-index:1000;background:rgba(0,0,0,0.01)'
+            close_on_select = 'drop.hidden=true;' if self.scenario == 'dropdown_autoclose' else ''
+            if self.scenario == 'dropdown_stuck_escape':
+                handlers = "document.addEventListener('keydown',function(e){if(e.key==='Escape'){drop.hidden=true;}});"
+            elif self.scenario == 'dropdown_stuck_outside':
+                handlers = ("document.addEventListener('click',function(e){"
+                            "if(!drop.hidden&&!drop.contains(e.target)&&!picker.contains(e.target)){drop.hidden=true;}});")
+            else:
+                handlers = ''
+            picker = f'''
+              <div data-qa="vacancy-response-popup-form-resume-dropdown">
+                <div role="button" id="picker" onclick="drop.hidden=false"><div data-qa="resume-title">Other resume</div></div>
+              </div>
+              <div data-qa="drop-base" id="drop" hidden style="{overlay_style}">
+                <div data-qa="magritte-select-option-{'b' * 40}">Other resume</div>
+                <div data-qa="magritte-select-option-{CONTENT['resume_id']}" onclick="event.stopPropagation();document.querySelector('[data-qa=resume-title]').textContent='{CONTENT['resume_title']}';{close_on_select}">{CONTENT['resume_title']}</div>
+              </div>
+              <script>
+                var drop = document.getElementById('drop');
+                var picker = document.getElementById('picker');
+                {handlers}
+              </script>'''
+            html = html.replace('<form id="application" hidden>',
+                                '<form id="application" data-qa="vacancy-response-popup-form" hidden style="padding-top:40px">')
+            html = re.sub(r'<select name="resume_hash">.*?</select>', picker, html, flags=re.S)
         return html
 
     async def serve_fixture(self, route):
@@ -324,6 +358,36 @@ class BrowserSafetyTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_application('approved_question')
         self.assertEqual(result['status'], 'success', result)
         self.assertEqual(self.posts[0]['task_42_text'], ['Approved answer'])
+
+    async def test_stuck_resume_dropdown_dismissed_with_escape(self):
+        with self.assertLogs('hh_mcp_server.scraping.apply', level='INFO') as logs:
+            result = await self.run_application('dropdown_stuck_escape')
+        self.assertEqual(result['status'], 'success', result)
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.posts[0]['resume_hash'], [CONTENT['resume_id']])
+        self.assertEqual(self.posts[0]['letter'], [CONTENT['cover_letter']])
+        self.assertTrue(any('resume_selector_dismiss=escape' in line for line in logs.output))
+
+    async def test_autoclosed_resume_dropdown_needs_no_dismissal(self):
+        with self.assertNoLogs('hh_mcp_server.scraping.apply', level='INFO'):
+            result = await self.run_application('dropdown_autoclose')
+        self.assertEqual(result['status'], 'success', result)
+        self.assertEqual(len(self.posts), 1)
+
+    async def test_stuck_resume_dropdown_dismissed_with_outside_click(self):
+        with self.assertLogs('hh_mcp_server.scraping.apply', level='INFO') as logs:
+            result = await self.run_application('dropdown_stuck_outside')
+        self.assertEqual(result['status'], 'success', result)
+        self.assertEqual(len(self.posts), 1)
+        self.assertTrue(any('resume_selector_dismiss=outside_click' in line for line in logs.output))
+
+    async def test_unclosable_resume_dropdown_blocks_before_dispatch(self):
+        result = await self.run_application('dropdown_stuck_forever')
+        self.assertEqual(result['status'], 'blocked', result)
+        self.assertEqual(result.get('stage'), 'resume_selector_cleanup')
+        self.assertEqual(result.get('dispatch_attempted'), False)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.dispatched, 0)
 
     async def test_http_success_without_page_confirmation_is_unverified(self):
         result = await self.run_application('no_marker')
