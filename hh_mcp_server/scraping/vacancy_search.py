@@ -109,7 +109,9 @@ async def search_vacancies(
     max_pages: int = 3,
 ) -> dict:
     all_vacancies = []
+    seen_keys: set[str] = set()
     total_found = None
+    pages_loaded = 0
 
     for page_num in range(max_pages):
         url = build_search_url(text, area, salary_from, salary_to, experience, schedule, page_num)
@@ -125,15 +127,28 @@ async def search_vacancies(
         if not vacancies:
             break
 
-        all_vacancies.extend(vacancies)
+        unique_vacancies = []
+        for vacancy in vacancies:
+            key = vacancy.get("id") or vacancy.get("url")
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            unique_vacancies.append(vacancy)
 
-        has_next = await page.query_selector(S.PAGER_NEXT)
-        if not has_next:
+        if not unique_vacancies:
+            logger.warning(
+                "Vacancy search page %d produced no new vacancy IDs; stopping pagination",
+                page_num,
+            )
             break
+
+        all_vacancies.extend(unique_vacancies)
+        pages_loaded += 1
 
     return {
         "total_found": total_found,
-        "pages_loaded": min(max_pages, (len(all_vacancies) // 20) + 1),
+        "pages_loaded": pages_loaded,
         "vacancies": all_vacancies,
         "vacancy_ids": [v["id"] for v in all_vacancies if v["id"]],
     }
@@ -160,7 +175,9 @@ async def get_recommended_vacancies(
 ) -> dict:
     """Fetch vacancies recommended by hh.ru for a specific resume."""
     all_vacancies = []
+    seen_keys: set[str] = set()
     total_found = None
+    pages_loaded = 0
 
     for page_num in range(max_pages):
         url = build_recommended_url(resume_id, page_num)
@@ -176,15 +193,28 @@ async def get_recommended_vacancies(
         if not vacancies:
             break
 
-        all_vacancies.extend(vacancies)
+        unique_vacancies = []
+        for vacancy in vacancies:
+            key = vacancy.get("id") or vacancy.get("url")
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            unique_vacancies.append(vacancy)
 
-        has_next = await page.query_selector(S.PAGER_NEXT)
-        if not has_next:
+        if not unique_vacancies:
+            logger.warning(
+                "Recommended vacancies page %d produced no new vacancy IDs; stopping pagination",
+                page_num,
+            )
             break
+
+        all_vacancies.extend(unique_vacancies)
+        pages_loaded += 1
 
     return {
         "total_found": total_found,
-        "pages_loaded": min(max_pages, (len(all_vacancies) // 20) + 1),
+        "pages_loaded": pages_loaded,
         "vacancies": all_vacancies,
         "vacancy_ids": [v["id"] for v in all_vacancies if v["id"]],
     }
