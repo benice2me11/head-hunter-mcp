@@ -57,6 +57,61 @@ class VacancySearchMarkupTests(unittest.IsolatedAsyncioTestCase):
             "до\xa0480 000\xa0₽\xa0за месяц, на руки",
         )
         self.assertEqual(result["vacancies"][0]["id"], "137050747")
+        self.assertEqual(result["pages_loaded"], 1)
+
+    async def test_multi_page_search_does_not_depend_on_pager_next(self):
+        async def fake_navigate(page, url, wait_selector=None, timeout=15000):
+            page_num = int(parse_qs(urlparse(url).query)["page"][0])
+            if page_num >= 2:
+                await page.set_content("<!doctype html><html><body></body></html>")
+                return
+
+            vacancy_id = "137050747" if page_num == 0 else "137050748"
+            await page.set_content(
+                f"""<!doctype html><html><body>
+                <h1 data-qa="vacancies-search-header">Найдено 2 вакансии «Codex»</h1>
+                <div data-qa="serp-item">
+                  <a data-qa="serp-item__title"
+                     href="https://hh.ru/vacancy/{vacancy_id}?query=Codex">
+                    Fullstack-разработчик {page_num}
+                  </a>
+                </div>
+                </body></html>"""
+            )
+
+        with patch(
+            "hh_mcp_server.scraping.vacancy_search.navigate_and_wait",
+            new=AsyncMock(side_effect=fake_navigate),
+        ) as navigate:
+            result = await search_vacancies(self.page, text="Codex", max_pages=3)
+
+        self.assertEqual(result["vacancy_ids"], ["137050747", "137050748"])
+        self.assertEqual(result["pages_loaded"], 2)
+        self.assertEqual(navigate.await_count, 3)
+
+    async def test_repeated_page_stops_pagination_without_duplicates(self):
+        async def fake_navigate(page, url, wait_selector=None, timeout=15000):
+            await page.set_content(
+                """<!doctype html><html><body>
+                <h1 data-qa="vacancies-search-header">Найдено 100 вакансий «Codex»</h1>
+                <div data-qa="serp-item">
+                  <a data-qa="serp-item__title"
+                     href="https://hh.ru/vacancy/137050747?query=Codex">
+                    Fullstack-разработчик
+                  </a>
+                </div>
+                </body></html>"""
+            )
+
+        with patch(
+            "hh_mcp_server.scraping.vacancy_search.navigate_and_wait",
+            new=AsyncMock(side_effect=fake_navigate),
+        ) as navigate:
+            result = await search_vacancies(self.page, text="Codex", max_pages=5)
+
+        self.assertEqual(result["vacancy_ids"], ["137050747"])
+        self.assertEqual(result["pages_loaded"], 1)
+        self.assertEqual(navigate.await_count, 2)
 
 
 if __name__ == "__main__":
