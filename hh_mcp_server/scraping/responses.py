@@ -2,7 +2,7 @@ import logging
 import re
 from urllib.parse import urljoin
 
-from playwright.async_api import Page
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from hh_mcp_server.constants import BASE_URL
 from hh_mcp_server.scraping.extractor import navigate_and_wait
@@ -32,8 +32,13 @@ async def _extract_visible_responses(
     raw_items = await page.locator('[data-qa="negotiations-item-vacancy"]').evaluate_all(
         """
         (vacancies, limit) => vacancies.slice(0, limit ?? vacancies.length).map((vacancy) => {
-            const card = vacancy.closest('div:has([data-qa="negotiations-item-company"]):has([data-qa="negotiations-item-date"])');
-            if (!card) return null;
+            // Employer/date markers are optional on some HH negotiation cards.
+            // The vacancy ID must still be retained for deduplication.
+            const card = vacancy.closest('div:has([data-qa="negotiations-item-company"]):has([data-qa="negotiations-item-date"])')
+                ?? vacancy.closest('[data-qa="negotiations-item"]')
+                ?? vacancy.closest('a')?.parentElement
+                ?? vacancy.parentElement
+                ?? vacancy;
             const vacancyLink = vacancy.closest('a');
             const company = card.querySelector('[data-qa="negotiations-item-company"]');
             const companyLink = company ? company.closest('a') : null;
@@ -78,6 +83,24 @@ class ResponsePaginationError(RuntimeError):
     """The history could not be verified as complete; never return partial dedup."""
 
 
+async def _next_page_control(page: Page, page_number: int):
+    """Prefer the numbered page, then an explicit next-page navigation control."""
+    selectors = (
+        f'button[data-qa="number-pages-{page_number}"]',
+        f'a[data-qa="number-pages-{page_number}"]',
+        'a[rel="next"]',
+        'button[data-qa="pager-next"]',
+        'a[data-qa="pager-next"]',
+        'button[data-qa="pagination-next"]',
+        'a[data-qa="pagination-next"]',
+    )
+    for selector in selectors:
+        control = page.locator(selector)
+        if await control.count():
+            return control.first
+    return None
+
+
 async def _wait_for_distinct_page(page: Page, previous_ids: set[str], page_number: int) -> None:
     # HH sometimes changes the card list without setting aria-current="true"
     # on the numbered button. Validate the data, not only the pager CSS.
@@ -92,8 +115,6 @@ async def _wait_for_distinct_page(page: Page, previous_ids: set[str], page_numbe
         return ids.length > 0 && ids.some((id) => !previousIds.includes(id));
     }
     """
-    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
     for attempt in range(2):
         try:
             await page.wait_for_function(js, arg=list(previous_ids), timeout=5000)
@@ -108,13 +129,41 @@ async def _wait_for_distinct_page(page: Page, previous_ids: set[str], page_numbe
                 "HH response page %d did not change in 5s; retrying numbered page",
                 page_number,
             )
-            next_button = page.locator(f'button[data-qa="number-pages-{page_number}"]')
-            if await next_button.count() == 0:
+            next_button = await _next_page_control(page, page_number)
+            if next_button is None:
                 raise ResponsePaginationError(
                     f"HH response page {page_number} navigation disappeared; "
                     "history incomplete"
                 ) from exc
-            await next_button.first.click()
+            await next_button.click()
+
+
+async def _pagination_dom_summary(page: Page) -> str:
+    """Minimal sanitized DOM facts for diagnosing missing controls (no applicant data)."""
+    try:
+        summary = await page.evaluate(
+            """
+            () => ({
+                vacancy_nodes: document.querySelectorAll(
+                    '[data-qa="negotiations-item-vacancy"]'
+                ).length,
+                numbered_buttons: Array.from(document.querySelectorAll(
+                    'button[data-qa^="number-pages-"], a[data-qa^="number-pages-"]'
+                )).map(el => el.getAttribute('data-qa')).slice(0, 12),
+                pager_controls: Array.from(document.querySelectorAll(
+                    'button[data-qa*="pager"], a[data-qa*="pager"], a[rel="next"]'
+                )).map(el => el.getAttribute('data-qa') || 'rel-next').slice(0, 12)
+            })
+            """
+        )
+        if not isinstance(summary, dict):
+            return "dom-unavailable"
+        nodes = summary.get("vacancy_nodes", "?")
+        numbered = summary.get("numbered_buttons", [])
+        controls = summary.get("pager_controls", [])
+        return f"dom_vacancy_nodes={nodes}; numbered={numbered}; pager={controls}"
+    except Exception:
+        return "dom-unavailable"
 
 
 async def _collect_tab(
@@ -185,16 +234,19 @@ async def _collect_tab(
             break
 
         next_page = page_number + 1
-        next_button = page.locator(f'button[data-qa="number-pages-{next_page}"]')
-        if await next_button.count() == 0:
+        next_button = await _next_page_control(page, next_page)
+        if next_button is None:
+            # Never report exhaustion if the tab counter promises more entries.
+            # Capture only structural DOM statistics, not applicant records.
+            dom_summary = await _pagination_dom_summary(page)
             if expected_count is not None and len(seen_ids) < expected_count:
                 raise ResponsePaginationError(
                     f"HH {tab_qa or 'response'} pager ended after "
                     f"{len(seen_ids)} of {expected_count} expected records; "
-                    "history incomplete"
+                    f"{dom_summary}; history incomplete"
                 )
             break
-        await next_button.first.click()
+        await next_button.click()
         await _wait_for_distinct_page(page, set(ids), next_page)
         page_number = next_page
 
@@ -271,4 +323,5 @@ async def get_my_responses(
             limit is None or len(active) + len(deleted) < limit
         ),
     }
+
 
