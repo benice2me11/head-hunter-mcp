@@ -41,9 +41,9 @@ class ResponseHistoryPaginationTests(unittest.IsolatedAsyncioTestCase):
         await self.page.set_content(f"""
           <div id="cards">{_card(1)}{_card(2)}</div>
           <button data-qa="number-pages-1" aria-current="true">1</button>
-          <button data-qa="number-pages-2">2</button>
+          <button data-qa="number-pages-2 ">2</button>
           <script>
-          document.querySelector('[data-qa="number-pages-2"]').onclick = () => {{
+          document.querySelector('[data-qa~="number-pages-2"]').onclick = () => {{
             setTimeout(() => {{
               document.getElementById('cards').innerHTML = {json.dumps(_card(3))};
             }}, 40);
@@ -67,7 +67,7 @@ class ResponseHistoryPaginationTests(unittest.IsolatedAsyncioTestCase):
         await self.page.set_content(f"""
           <div id="cards">{_card(1)}{_card(2)}</div>
           <button data-qa="number-pages-1" aria-current="true">1</button>
-          <button data-qa="number-pages-2">2</button>
+          <button data-qa="number-pages-2 ">2</button>
         """)
         # Simulate a frozen UI instead of spending ten real seconds in a timeout.
         with patch.object(
@@ -121,11 +121,11 @@ class ResponseHistoryPaginationTests(unittest.IsolatedAsyncioTestCase):
           <button data-qa="tab_filter_deleted" aria-selected="false" aria-label="????????? 2">Deleted</button>
           <div id="cards">{_card(1)}{_card(2)}</div>
           <button data-qa="number-pages-1" aria-current="true">1</button>
-          <button data-qa="number-pages-2">2</button>
+          <button data-qa="number-pages-2 ">2</button>
           <script>
             const all = document.querySelector('[data-qa="tab_filter_all"]');
             const deleted = document.querySelector('[data-qa="tab_filter_deleted"]');
-            const pageTwo = document.querySelector('[data-qa="number-pages-2"]');
+            const pageTwo = document.querySelector('[data-qa~="number-pages-2"]');
             pageTwo.onclick = () => {{
               setTimeout(() => {{
                 document.getElementById('cards').innerHTML = {json.dumps(_card(3))};

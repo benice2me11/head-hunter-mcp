@@ -108,7 +108,9 @@ async def _wait_for_distinct_page(page: Page, previous_ids: set[str], page_numbe
                 "HH response page %d did not change in 5s; retrying numbered page",
                 page_number,
             )
-            next_button = page.locator(f'button[data-qa="number-pages-{page_number}"]')
+            # HH adds a whitespace-separated selected-state token to data-qa,
+            # and can leave a trailing space on unselected page buttons.
+            next_button = page.locator(f'button[data-qa~="number-pages-{page_number}"]')
             if await next_button.count() == 0:
                 raise ResponsePaginationError(
                     f"HH response page {page_number} navigation disappeared; "
@@ -185,7 +187,7 @@ async def _collect_tab(
             break
 
         next_page = page_number + 1
-        next_button = page.locator(f'button[data-qa="number-pages-{next_page}"]')
+        next_button = page.locator(f'button[data-qa~="number-pages-{next_page}"]')
         if await next_button.count() == 0:
             if expected_count is not None and len(seen_ids) < expected_count:
                 raise ResponsePaginationError(
