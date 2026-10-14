@@ -74,59 +74,129 @@ async def _extract_visible_responses(
     return items
 
 
+class ResponsePaginationError(RuntimeError):
+    """The history could not be verified as complete; never return partial dedup."""
+
+
+async def _wait_for_distinct_page(page: Page, previous_ids: set[str], page_number: int) -> None:
+    # HH sometimes changes the card list without setting aria-current="true"
+    # on the numbered button. Validate the data, not only the pager CSS.
+    js = """
+    (previousIds) => {
+        const ids = Array.from(
+            document.querySelectorAll('[data-qa="negotiations-item-vacancy"]')
+        ).map((node) => {
+            const href = node.closest('a')?.getAttribute('href') || '';
+            return href.match(/\\/vacancy\\/(\\d+)/)?.[1] || null;
+        }).filter(Boolean);
+        return ids.length > 0 && ids.some((id) => !previousIds.includes(id));
+    }
+    """
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    for attempt in range(2):
+        try:
+            await page.wait_for_function(js, arg=list(previous_ids), timeout=5000)
+            return
+        except PlaywrightTimeoutError as exc:
+            if attempt:
+                raise ResponsePaginationError(
+                    f"HH response page {page_number} did not load distinct vacancy IDs "
+                    "after two attempts; history incomplete"
+                ) from exc
+            logger.warning(
+                "HH response page %d did not change in 5s; retrying numbered page",
+                page_number,
+            )
+            next_button = page.locator(f'button[data-qa="number-pages-{page_number}"]')
+            if await next_button.count() == 0:
+                raise ResponsePaginationError(
+                    f"HH response page {page_number} navigation disappeared; "
+                    "history incomplete"
+                ) from exc
+            await next_button.first.click()
+
+
 async def _collect_tab(
     page: Page,
     *,
     tab_qa: str | None,
     deleted: bool,
     limit: int | None = None,
+    expected_count: int | None = None,
 ) -> list[dict]:
     if tab_qa:
         tab = page.locator(f'button[data-qa="{tab_qa}"]')
         if await tab.count() == 0:
             if tab_qa != "tab_filter_all":
+                if expected_count:
+                    raise ResponsePaginationError(
+                        f"HH {tab_qa} tab missing with {expected_count} expected records; "
+                        "history incomplete"
+                    )
                 return []
         else:
             await tab.click()
-            await page.wait_for_selector(
-                f'button[data-qa="{tab_qa}"][aria-selected="true"]', timeout=3000
-            )
+            try:
+                await page.wait_for_selector(
+                    f'button[data-qa="{tab_qa}"][aria-selected="true"]', timeout=6000
+                )
+            except PlaywrightTimeoutError as exc:
+                raise ResponsePaginationError(
+                    f"HH {tab_qa} tab did not become selected; history incomplete"
+                ) from exc
             await page.wait_for_timeout(250)
 
     results: list[dict] = []
-    seen_pages: set[int] = set()
+    seen_ids: set[str] = set()
+    seen_pages: set[frozenset[str]] = set()
+    page_number = 1
 
     while True:
-        selected = page.locator('button[aria-current="true"][data-qa^="number-pages-"]')
-        current_page = 1
-        if await selected.count():
-            qa = await selected.first.get_attribute("data-qa")
-            match = re.search(r"number-pages-(\d+)", qa or "")
-            if match:
-                current_page = int(match.group(1))
-
-        if current_page in seen_pages:
-            break
-        seen_pages.add(current_page)
+        if page_number > 100:
+            raise ResponsePaginationError(
+                f"HH {tab_qa or 'response'} exceeded 100 pages; history incomplete"
+            )
         remaining = None if limit is None else max(limit - len(results), 0)
         if remaining == 0:
             break
-        results.extend(
-            await _extract_visible_responses(page, deleted=deleted, limit=remaining)
+        page_items = await _extract_visible_responses(
+            page, deleted=deleted, limit=remaining
         )
+        ids = frozenset(item["vacancy_id"] for item in page_items)
+        if not ids:
+            if expected_count == 0:
+                break
+            raise ResponsePaginationError(
+                f"HH {tab_qa or 'response'} page {page_number} had no readable "
+                "vacancy IDs; history incomplete"
+            )
+        if ids in seen_pages:
+            raise ResponsePaginationError(
+                f"HH {tab_qa or 'response'} page {page_number} repeated an "
+                "earlier set of vacancy IDs; history incomplete"
+            )
+        seen_pages.add(ids)
+        for item in page_items:
+            if item["vacancy_id"] not in seen_ids:
+                results.append(item)
+                seen_ids.add(item["vacancy_id"])
         if limit is not None and len(results) >= limit:
             break
 
-        next_page = current_page + 1
-        next_button = page.locator(f'button[data-qa^="number-pages-{next_page}"]')
+        next_page = page_number + 1
+        next_button = page.locator(f'button[data-qa="number-pages-{next_page}"]')
         if await next_button.count() == 0:
+            if expected_count is not None and len(seen_ids) < expected_count:
+                raise ResponsePaginationError(
+                    f"HH {tab_qa or 'response'} pager ended after "
+                    f"{len(seen_ids)} of {expected_count} expected records; "
+                    "history incomplete"
+                )
             break
-        await next_button.click()
-        await page.wait_for_selector(
-            f'button[data-qa^="number-pages-{next_page}"][aria-current="true"]',
-            timeout=3000,
-        )
-        await page.wait_for_timeout(250)
+        await next_button.first.click()
+        await _wait_for_distinct_page(page, set(ids), next_page)
+        page_number = next_page
 
     return results
 
@@ -157,12 +227,20 @@ async def get_my_responses(
             tab_counts[key] = int(match.group(1)) if match else 0
 
     active = await _collect_tab(
-        page, tab_qa="tab_filter_all", deleted=False, limit=limit
+        page,
+        tab_qa="tab_filter_all",
+        deleted=False,
+        limit=limit,
+        expected_count=tab_counts.get("all"),
     )
     deleted_limit = None if limit is None else max(limit - len(active), 0)
     deleted = (
         await _collect_tab(
-            page, tab_qa="tab_filter_deleted", deleted=True, limit=deleted_limit
+            page,
+            tab_qa="tab_filter_deleted",
+            deleted=True,
+            limit=deleted_limit,
+            expected_count=tab_counts.get("deleted"),
         )
         if include_deleted and deleted_limit != 0
         else []
@@ -187,4 +265,10 @@ async def get_my_responses(
         "responses": responses,
         "active_count": sum(not item["deleted"] for item in responses),
         "deleted_count": sum(item["deleted"] for item in responses),
+        "history_complete": include_deleted and (
+            "all" in tab_counts and "deleted" in tab_counts
+        ) and (
+            limit is None or len(active) + len(deleted) < limit
+        ),
     }
+
