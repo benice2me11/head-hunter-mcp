@@ -1,17 +1,25 @@
 """Regression tests for current hh.ru vacancy search markup."""
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import async_playwright
 
-from hh_mcp_server.scraping.vacancy_search import build_search_url, search_vacancies
+from hh_mcp_server.scraping.vacancy_search import (
+    _expected_total,
+    build_search_url,
+    search_vacancies,
+)
 
 
 class VacancySearchMarkupTests(unittest.IsolatedAsyncioTestCase):
     def test_search_url_defaults_to_newest_first(self):
         query = parse_qs(urlparse(build_search_url("Golang backend")).query)
         self.assertEqual(query["order_by"], ["publication_time"])
+
+    def test_expected_total_accepts_hh_spaced_numbers(self):
+        self.assertEqual(_expected_total("Найдено 1 170 вакансий"), 1170)
 
     async def asyncSetUp(self):
         self.playwright = await async_playwright().start()
@@ -112,6 +120,40 @@ class VacancySearchMarkupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["vacancy_ids"], ["137050747"])
         self.assertEqual(result["pages_loaded"], 1)
         self.assertEqual(navigate.await_count, 2)
+        self.assertEqual(result["pagination"]["stop_reason"], "repeated_page")
+        self.assertFalse(result["pagination"]["coverage_complete"])
+
+    async def test_client_hydration_expands_initial_twenty_cards_to_fifty(self):
+        def cards(start, end):
+            return "".join(
+                '<div data-qa="serp-item"><a data-qa="serp-item__title" '
+                f'href="/vacancy/{i}">Role {i}</a></div>'
+                for i in range(start, end)
+            )
+
+        initial = cards(1000, 1020)
+        late = json.dumps(cards(1020, 1050))
+
+        async def fake_navigate(page, url, wait_selector=None, timeout=15000):
+            await page.set_content(f"""
+              <h1 data-qa="vacancies-search-header">Найдено 50 вакансий</h1>
+              <div id="items">{initial}</div>
+              <script>
+                setTimeout(() =>
+                  document.getElementById('items')
+                    .insertAdjacentHTML('beforeend', {late}), 180);
+              </script>
+            """)
+
+        with patch(
+            "hh_mcp_server.scraping.vacancy_search.navigate_and_wait",
+            new=AsyncMock(side_effect=fake_navigate),
+        ):
+            result = await search_vacancies(self.page, text="Golang", max_pages=1)
+
+        self.assertEqual(len(result["vacancy_ids"]), 50)
+        self.assertEqual(result["pagination"]["page_diagnostics"][0]["cards"], 50)
+        self.assertTrue(result["pagination"]["coverage_complete"])
 
 
 if __name__ == "__main__":
